@@ -269,6 +269,65 @@ def test_semantic_visual_aggregator_recurrent_shapes_and_pose_decoder():
     assert decoder(q2).shape == (2, 8)
 
 
+def test_goal_pose_modules_are_built_only_for_the_active_stage():
+    def make_policy(config):
+        policy = object.__new__(MolmoAct2Policy)
+        torch.nn.Module.__init__(policy)
+        policy.config = config
+        policy._resolve_backbone_hidden_size = lambda: 16
+        policy._goal_pose_dim = lambda: 8
+        policy._action_expert = lambda: SimpleNamespace(llm_kv_dim=12)
+        policy._build_goal_pose_modules(torch.float32)
+        return policy
+
+    stage1 = make_policy(
+        SimpleNamespace(
+            enable_goal_pose=True,
+            goal_conditioning_mode="vlm_appended",
+            goal_token_source="se3_encoder",
+            goal_hidden_dim=32,
+            num_goal_tokens=4,
+        )
+    )
+    assert hasattr(stage1, "goal_se3_encoder")
+    assert not hasattr(stage1, "goal_queries")
+    assert not hasattr(stage1, "goal_pose_decoder")
+
+    v1_stage2 = make_policy(
+        SimpleNamespace(
+            enable_goal_pose=True,
+            goal_conditioning_mode="vlm_appended",
+            goal_token_source="learnable_queries",
+            goal_hidden_dim=32,
+            num_goal_tokens=4,
+            init_queries_from_se3_encoder=False,
+            enable_pose_reconstruction=True,
+        )
+    )
+    assert hasattr(v1_stage2, "goal_queries")
+    assert hasattr(v1_stage2, "goal_pose_decoder")
+    assert not hasattr(v1_stage2, "goal_se3_encoder")
+
+    v2_stage2 = make_policy(
+        SimpleNamespace(
+            enable_goal_pose=True,
+            goal_conditioning_mode="semantic_visual_recurrent",
+            goal_token_source="learnable_queries",
+            goal_hidden_dim=32,
+            num_semantic_visual_tokens=10,
+            semantic_visual_hidden_dim=16,
+            semantic_visual_num_heads=4,
+            semantic_visual_ffn_ratio=2.0,
+            semantic_visual_dropout=0.0,
+        )
+    )
+    assert hasattr(v2_stage2, "semantic_visual_aggregator")
+    assert hasattr(v2_stage2, "semantic_visual_pose_decoder")
+    assert not hasattr(v2_stage2, "goal_se3_encoder")
+    assert not hasattr(v2_stage2, "goal_queries")
+    assert not hasattr(v2_stage2, "goal_pose_decoder")
+
+
 def test_goal_token_embeddings_from_queries_and_encoder():
     policy = object.__new__(MolmoAct2Policy)
     torch.nn.Module.__init__(policy)

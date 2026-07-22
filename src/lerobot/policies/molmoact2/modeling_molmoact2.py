@@ -1125,24 +1125,11 @@ class MolmoAct2Policy(PreTrainedPolicy):
     def _build_goal_pose_modules(self, model_dtype: torch.dtype) -> None:
         hidden = self._resolve_backbone_hidden_size()
         pose_dim = self._goal_pose_dim()
-        num_tokens = int(self.config.num_goal_tokens)
         inner = int(self.config.goal_hidden_dim)
         self._goal_hidden_size = hidden
         self._goal_pose_dim_cached = pose_dim
-        self.goal_se3_encoder = _GoalSE3Encoder(pose_dim, num_tokens, hidden, inner).to(dtype=model_dtype)
-        self.goal_pose_decoder = _GoalPoseDecoder(num_tokens, hidden, pose_dim, inner).to(dtype=model_dtype)
-        query = torch.empty(num_tokens, hidden)
-        torch.nn.init.trunc_normal_(query, std=0.02)
-        self.goal_queries = torch.nn.Parameter(query.to(dtype=model_dtype))
-        if self.config.init_queries_from_se3_encoder:
-            with torch.no_grad():
-                canonical = torch.zeros(1, pose_dim, dtype=model_dtype)
-                self.goal_queries.copy_(self.goal_se3_encoder(canonical)[0])
+
         if self._uses_semantic_visual_conditioning():
-            for module in (self.goal_se3_encoder, self.goal_pose_decoder):
-                for parameter in module.parameters():
-                    parameter.requires_grad_(False)
-            self.goal_queries.requires_grad_(False)
             action_expert = self._action_expert()
             kv_dim = int(getattr(action_expert, "llm_kv_dim"))
             latent_dim = int(self.config.semantic_visual_hidden_dim)
@@ -1159,6 +1146,29 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 latent_dim=latent_dim,
                 pose_dim=pose_dim,
                 inner_dim=inner,
+            ).to(dtype=model_dtype)
+            return
+
+        num_tokens = int(self.config.num_goal_tokens)
+        if self.config.goal_token_source == "se3_encoder":
+            self.goal_se3_encoder = _GoalSE3Encoder(
+                pose_dim, num_tokens, hidden, inner
+            ).to(dtype=model_dtype)
+            return
+
+        query = torch.empty(num_tokens, hidden)
+        torch.nn.init.trunc_normal_(query, std=0.02)
+        self.goal_queries = torch.nn.Parameter(query.to(dtype=model_dtype))
+        if self.config.init_queries_from_se3_encoder:
+            initializer = _GoalSE3Encoder(pose_dim, num_tokens, hidden, inner).to(
+                dtype=model_dtype
+            )
+            with torch.no_grad():
+                canonical = torch.zeros(1, pose_dim, dtype=model_dtype)
+                self.goal_queries.copy_(initializer(canonical)[0])
+        if self.config.enable_pose_reconstruction:
+            self.goal_pose_decoder = _GoalPoseDecoder(
+                num_tokens, hidden, pose_dim, inner
             ).to(dtype=model_dtype)
 
     def _enable_gradient_checkpointing(self) -> None:
