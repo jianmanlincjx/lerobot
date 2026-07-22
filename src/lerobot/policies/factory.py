@@ -303,6 +303,31 @@ def make_pre_post_processors(
                     "molmoact2_masked_normalizer",
                     preprocessor_overrides.pop("normalizer_processor"),
                 )
+            masked_stats = processor_molmoact2._add_gripper_masks_to_stats(
+                kwargs.get("dataset_stats"),
+                kwargs.get("dataset_meta"),
+                normalize_gripper=policy_cfg.normalize_gripper,
+                dataset_feature_names=policy_cfg.dataset_feature_names,
+            )
+            if "molmoact2_masked_normalizer" in preprocessor_overrides:
+                preprocessor_overrides["molmoact2_masked_normalizer"]["stats"] = masked_stats
+            pack_overrides = dict(preprocessor_overrides.get("molmoact2_pack_inputs", {}))
+            pack_overrides.update(
+                {
+                    "checkpoint_path": policy_cfg.checkpoint_path,
+                    "checkpoint_revision": policy_cfg.checkpoint_revision,
+                    "checkpoint_force_download": policy_cfg.checkpoint_force_download,
+                    "action_mode": policy_cfg.action_mode,
+                    "image_keys": list(policy_cfg.image_keys),
+                    "disable_visual_input": policy_cfg.disable_visual_input,
+                    "enable_goal_pose": policy_cfg.enable_goal_pose,
+                    "setup_type": policy_cfg.setup_type,
+                    "control_mode": policy_cfg.control_mode,
+                    "chunk_size": policy_cfg.chunk_size,
+                    "max_sequence_length": policy_cfg.max_sequence_length,
+                }
+            )
+            preprocessor_overrides["molmoact2_pack_inputs"] = pack_overrides
             kwargs["preprocessor_overrides"] = preprocessor_overrides
 
             postprocessor_overrides = dict(kwargs.get("postprocessor_overrides", {}))
@@ -311,6 +336,8 @@ def make_pre_post_processors(
                     "molmoact2_masked_unnormalizer",
                     postprocessor_overrides.pop("unnormalizer_processor"),
                 )
+            if "molmoact2_masked_unnormalizer" in postprocessor_overrides:
+                postprocessor_overrides["molmoact2_masked_unnormalizer"]["stats"] = masked_stats
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
         preprocessor = PolicyProcessorPipeline.from_pretrained(

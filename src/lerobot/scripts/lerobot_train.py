@@ -19,6 +19,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
 import time
 from contextlib import nullcontext
@@ -156,6 +157,21 @@ def update_policy(
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
+    if output_dict is None:
+        output_dict = {}
+    for group in optimizer.param_groups:
+        group_name = group.get("name")
+        if not group_name:
+            continue
+        metric_name = f"lr_{group_name}"
+        if metric_name in train_metrics.metrics:
+            setattr(train_metrics, metric_name, group["lr"])
+        output_dict[f"lr/{group_name}"] = group["lr"]
+    for loss_name in ("action_flow_loss", "discrete_ce_loss", "pose_recon_loss"):
+        if loss_name in train_metrics.metrics and loss_name in output_dict:
+            setattr(train_metrics, loss_name, float(output_dict[loss_name]))
+    if "gpu_mem_gb" in train_metrics.metrics and torch.cuda.is_available():
+        train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 
@@ -286,6 +302,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             peft_cli_overrides = dataclasses.asdict(cfg.peft)
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
 
+    if is_main_process:
+        training_audit = getattr(policy, "training_audit", None)
+        if callable(training_audit):
+            logging.info("Policy training audit: %s", json.dumps(training_audit(), sort_keys=True))
+
     # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
 
@@ -307,8 +328,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
-    if cfg.is_reward_model_training:
-        processor_kwargs["dataset_meta"] = dataset.meta
+    processor_kwargs["dataset_meta"] = dataset.meta
 
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
@@ -426,9 +446,23 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         "loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
         "lr": AverageMeter("lr", ":0.1e"),
+        "gpu_mem_gb": AverageMeter("mem_gb", ":.1f"),
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
     }
+    for group in optimizer.param_groups:
+        group_name = group.get("name")
+        if group_name:
+            train_metrics[f"lr_{group_name}"] = AverageMeter(f"lr_{group_name}", ":0.1e")
+
+    # Break the total loss into its named components so each is logged separately.
+    policy_cfg = getattr(cfg, "policy", None)
+    if getattr(policy_cfg, "action_mode", None) in ("continuous", "both"):
+        train_metrics["action_flow_loss"] = AverageMeter("flow", ":.3f")
+    if getattr(policy_cfg, "action_mode", None) in ("discrete", "both"):
+        train_metrics["discrete_ce_loss"] = AverageMeter("ce", ":.3f")
+    if getattr(policy_cfg, "enable_pose_reconstruction", False):
+        train_metrics["pose_recon_loss"] = AverageMeter("pose", ":.3f")
 
     # Keep global batch size for logging; MetricsTracker handles world size internally.
     effective_batch_size = cfg.batch_size * accelerator.num_processes
@@ -454,6 +488,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    first_batch_audited = False
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -461,6 +496,30 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
         batch = preprocessor(batch)
+        if is_main_process and not first_batch_audited:
+            visual_inputs = {
+                key: list(value.shape)
+                for key, value in batch.items()
+                if key
+                in {
+                    "pixel_values",
+                    "image_token_pooling",
+                    "image_grids",
+                    "image_num_crops",
+                }
+                and torch.is_tensor(value)
+            }
+            logging.info(
+                "Processed batch visual audit: %s",
+                json.dumps(
+                    {
+                        "visual_inputs_present": bool(visual_inputs),
+                        "visual_inputs": visual_inputs,
+                    },
+                    sort_keys=True,
+                ),
+            )
+            first_batch_audited = True
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(

@@ -67,6 +67,8 @@ class WandBConfig:
 @dataclass
 class EvalConfig:
     n_episodes: int = 50
+    # Number of rollout videos to retain per task. Keep this at 0 for large benchmarks.
+    max_episodes_rendered: int = 0
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
     # Set to 0 for auto-tuning based on available CPU cores and n_episodes.
     batch_size: int = 0

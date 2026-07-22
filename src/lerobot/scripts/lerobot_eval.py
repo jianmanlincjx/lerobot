@@ -572,10 +572,11 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
+            max_episodes_rendered=cfg.eval.max_episodes_rendered,
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            live_output_path=Path(cfg.output_dir) / "live_eval.json",
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -706,6 +707,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    live_output_path: Path | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -723,6 +725,37 @@ def eval_policy_all(
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
     overall: dict[str, list] = {k: [] for k in ACC_KEYS}
     per_task_infos: list[dict] = []
+
+    def _aggregate(acc: dict[str, list]) -> dict:
+        successes = acc["successes"]
+        elapsed = time.time() - start_t
+        return {
+            "avg_sum_reward": float(np.mean(acc["sum_rewards"])) if acc["sum_rewards"] else float("nan"),
+            "avg_max_reward": float(np.mean(acc["max_rewards"])) if acc["max_rewards"] else float("nan"),
+            "pc_success": float(np.mean(successes) * 100) if successes else float("nan"),
+            "n_success": int(np.sum(successes)) if successes else 0,
+            "n_episodes": len(acc["sum_rewards"]),
+            "eval_s": elapsed,
+        }
+
+    def _write_live(status: str) -> None:
+        if live_output_path is None:
+            return
+        payload = {
+            "status": status,
+            "completed_tasks": len(per_task_infos),
+            "total_tasks": len(tasks),
+            "per_task": per_task_infos,
+            "per_group": {group: _aggregate(acc) for group, acc in group_acc.items()},
+            "overall": _aggregate(overall),
+            "updated_at": time.time(),
+        }
+        live_output_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = live_output_path.with_suffix(f"{live_output_path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(live_output_path)
+
+    _write_live("running")
 
     # small inline helper to accumulate one task's metrics into accumulators
     def _accumulate_to(group: str, metrics: dict):
@@ -774,6 +807,7 @@ def eval_policy_all(
                 tg, tid, metrics = task_runner(task_group, task_id, env)
                 _accumulate_to(tg, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                _write_live("running")
             finally:
                 env.close()
                 # Prefetch next task's workers *after* closing current env to prevent
@@ -795,6 +829,7 @@ def eval_policy_all(
                     tg, tid, metrics = fut.result()
                     _accumulate_to(tg, metrics)
                     per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                    _write_live("running")
                 finally:
                     env.close()
 
@@ -826,6 +861,8 @@ def eval_policy_all(
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
     }
+
+    _write_live("final")
 
     return {
         "per_task": per_task_infos,

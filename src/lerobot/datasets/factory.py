@@ -22,7 +22,7 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
+from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, OBS_STATE, REWARD
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
@@ -50,6 +50,11 @@ def resolve_delta_timestamps(
             }
             returns `None` if the resulting dict is empty.
     """
+    # Optional: load a future observation.state frame (the chunk-end target pose) for
+    # goal-conditioned policies (e.g. MolmoAct2 goal-pose prior) WITHOUT pulling extra
+    # image frames. This is applied only to observation.state so cameras stay single-frame.
+    target_pose_delta_index = getattr(cfg, "target_pose_delta_index", None)
+
     delta_timestamps = {}
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
@@ -58,6 +63,15 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+        if key == OBS_STATE and target_pose_delta_index is not None:
+            base_indices = (
+                list(cfg.observation_delta_indices)
+                if cfg.observation_delta_indices is not None
+                else [0]
+            )
+            # Current frame stays at index 0; the target pose is appended as the last index.
+            indices = base_indices + [int(target_pose_delta_index)]
+            delta_timestamps[key] = [i / ds_meta.fps for i in indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None

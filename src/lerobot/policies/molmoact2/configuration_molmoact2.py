@@ -4,10 +4,11 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from torch.optim.lr_scheduler import LambdaLR
+
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import (
     AdamWConfig,
-    CosineDecayWithWarmupSchedulerConfig,
     LRSchedulerConfig,
     OptimizerConfig,
 )
@@ -28,23 +29,56 @@ MOLMOACT2_DISCRETE_ACTION_TOKENS_PER_DIM = 0.95
 
 @LRSchedulerConfig.register_subclass("molmoact2_cosine_decay_with_warmup")
 @dataclass
-class MolmoAct2CosineDecayWithWarmupSchedulerConfig(CosineDecayWithWarmupSchedulerConfig):
-    """MolmoAct2-local cosine scheduler with optional decay-step auto-match.
+class MolmoAct2CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
+    """Cosine decay with independent warmup for each MolmoAct2 parameter group."""
 
-    LeRobot's generic cosine scheduler keeps an explicit integer decay length.
-    For MolmoAct2, leaving num_decay_steps unset means "decay across this run's
-    training steps"; build() is the first point where num_training_steps is known.
-    """
-
+    peak_lr: float
+    decay_lr: float
+    num_warmup_steps: int
     num_decay_steps: int | None
+    vlm_warmup_steps: int | None = None
+    vit_warmup_steps: int | None = None
+    connector_warmup_steps: int | None = None
+    action_expert_warmup_steps: int | None = None
+    goal_warmup_steps: int | None = None
 
     def build(self, optimizer, num_training_steps: int):
-        return CosineDecayWithWarmupSchedulerConfig(
-            peak_lr=self.peak_lr,
-            decay_lr=self.decay_lr,
-            num_warmup_steps=self.num_warmup_steps,
-            num_decay_steps=num_training_steps if self.num_decay_steps is None else self.num_decay_steps,
-        ).build(optimizer, num_training_steps=num_training_steps)
+        decay_steps = num_training_steps if self.num_decay_steps is None else self.num_decay_steps
+        if decay_steps < 1:
+            raise ValueError(f"num_decay_steps must be positive, got {decay_steps}.")
+
+        warmup_by_group = {
+            "vlm": self.vlm_warmup_steps,
+            "vit": self.vit_warmup_steps,
+            "connector": self.connector_warmup_steps,
+            "action_expert": self.action_expert_warmup_steps,
+            "goal": self.goal_warmup_steps,
+        }
+        lambdas = []
+        for group in optimizer.param_groups:
+            group_name = str(group.get("name", "vlm"))
+            configured_warmup = warmup_by_group.get(group_name)
+            warmup_steps = self.num_warmup_steps if configured_warmup is None else configured_warmup
+            decay_ratio = (
+                min(float(self.decay_lr) / float(self.peak_lr), 1.0) if self.peak_lr > 0 else 1.0
+            )
+
+            def lr_lambda(
+                current_step: int,
+                *,
+                warmup_steps: int = int(warmup_steps),
+                decay_ratio: float = decay_ratio,
+            ) -> float:
+                if warmup_steps > 0 and current_step < warmup_steps:
+                    return float(current_step + 1) / float(warmup_steps + 1)
+                decay_span = max(1, int(decay_steps) - warmup_steps)
+                progress = min(max(current_step - warmup_steps, 0) / decay_span, 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return decay_ratio + (1.0 - decay_ratio) * cosine
+
+            lambdas.append(lr_lambda)
+
+        return LambdaLR(optimizer, lr_lambda=lambdas, last_epoch=-1)
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -58,6 +92,7 @@ def infer_molmoact2_max_sequence_length(
     action_dim: int,
     action_horizon: int,
     include_discrete_action: bool,
+    num_goal_tokens: int = 0,
 ) -> int:
     """Infer the padded text/image sequence cap from MolmoAct2's fixed token layout."""
     if num_images < 1:
@@ -68,12 +103,15 @@ def infer_molmoact2_max_sequence_length(
         action_dim = 1
     if action_horizon < 1:
         action_horizon = 1
+    if num_goal_tokens < 0:
+        num_goal_tokens = 0
 
     image_tokens = num_images * MOLMOACT2_IMAGE_TOKENS_PER_IMAGE
     prompt_tokens = (
         MOLMOACT2_FIXED_PROMPT_TOKEN_BUDGET
         + MOLMOACT2_TASK_TOKEN_BUDGET
         + state_dim
+        + num_goal_tokens
         + MOLMOACT2_SEQUENCE_LENGTH_MARGIN
     )
     action_tokens = 0
@@ -98,6 +136,13 @@ class MolmoAct2Config(PreTrainedConfig):
     checkpoint_path: str = "allenai/MolmoAct2"
     checkpoint_revision: str | None = None
     checkpoint_force_download: bool = False
+    # Optional clean bootstrap: load only VLM tensors from this checkpoint, then
+    # reset the action expert initialized by checkpoint_path's MolmoAct2 template.
+    vlm_checkpoint_path: str | None = None
+    vlm_checkpoint_revision: str | None = None
+    vlm_checkpoint_force_download: bool = False
+    randomize_action_expert: bool = False
+    audit_bootstrap: bool = False
     trust_remote_code: bool = True
 
     n_obs_steps: int = 1
@@ -113,6 +158,26 @@ class MolmoAct2Config(PreTrainedConfig):
     setup_type: str = ""
     control_mode: str = ""
     image_keys: list[str] = field(default_factory=list)
+    disable_visual_input: bool = False
+    # Goal-pose action prior (two-stage). Goal tokens are K continuous embeddings
+    # inserted into the VLM sequence (after language+state); the action expert reads
+    # them via its per-layer cross-attention. Stage 1 sources them from an SE(3)
+    # encoder over the chunk-end target state; Stage 2 sources them from learnable
+    # queries that the VLM contextualizes from vision, supervised by a pose decoder.
+    enable_goal_pose: bool = False
+    num_goal_tokens: int = 4
+    goal_token_source: str = "se3_encoder"  # "se3_encoder" (Stage 1) | "learnable_queries" (Stage 2)
+    goal_hidden_dim: int = 512
+    # Frame offset (relative to the current frame) whose observation.state defines the
+    # target pose. Defaults to chunk_size (s_{t+H}) at training time; must be set when
+    # goal-pose is enabled and a target is needed (Stage 1, or Stage 2 pose reconstruction).
+    target_pose_delta_index: int | None = None
+    mask_image_from_action_expert: bool = False
+    enable_pose_reconstruction: bool = False
+    pose_recon_loss_weight: float = 1.0
+    init_queries_from_se3_encoder: bool = False
+    optimizer_goal_lr: float = 5e-5
+    scheduler_goal_warmup_steps: int | None = None
     normalize_language: bool = True
     add_setup_tokens: bool = True
     add_control_tokens: bool = True
@@ -168,6 +233,10 @@ class MolmoAct2Config(PreTrainedConfig):
     optimizer_grad_clip_norm: float = 1.0
 
     scheduler_warmup_steps: int = 200
+    scheduler_vlm_warmup_steps: int | None = None
+    scheduler_vit_warmup_steps: int | None = None
+    scheduler_connector_warmup_steps: int | None = None
+    scheduler_action_expert_warmup_steps: int | None = None
     scheduler_decay_steps: int | None = None
     scheduler_decay_lr: float = 1e-6
 
@@ -245,6 +314,53 @@ class MolmoAct2Config(PreTrainedConfig):
             )
         if self.max_sequence_length is not None and self.max_sequence_length < 1:
             raise ValueError(f"max_sequence_length must be >= 1 or None, got {self.max_sequence_length}.")
+        if self.randomize_action_expert and not self.vlm_checkpoint_path:
+            raise ValueError("randomize_action_expert=true requires policy.vlm_checkpoint_path.")
+        if self.vlm_checkpoint_path and not self.randomize_action_expert:
+            raise ValueError(
+                "policy.vlm_checkpoint_path requires randomize_action_expert=true so released "
+                "MolmoAct2 action-expert weights cannot leak into a clean bootstrap."
+            )
+        for name, value in (
+            ("scheduler_warmup_steps", self.scheduler_warmup_steps),
+            ("scheduler_vlm_warmup_steps", self.scheduler_vlm_warmup_steps),
+            ("scheduler_vit_warmup_steps", self.scheduler_vit_warmup_steps),
+            ("scheduler_connector_warmup_steps", self.scheduler_connector_warmup_steps),
+            ("scheduler_action_expert_warmup_steps", self.scheduler_action_expert_warmup_steps),
+            ("scheduler_goal_warmup_steps", self.scheduler_goal_warmup_steps),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}.")
+        if self.goal_token_source not in {"se3_encoder", "learnable_queries"}:
+            raise ValueError(
+                f"Unsupported goal_token_source={self.goal_token_source!r}. "
+                "Expected 'se3_encoder' or 'learnable_queries'."
+            )
+        if self.enable_goal_pose:
+            if self.num_goal_tokens < 1:
+                raise ValueError(f"num_goal_tokens must be >= 1, got {self.num_goal_tokens}.")
+            if self.pose_recon_loss_weight < 0:
+                raise ValueError(
+                    f"pose_recon_loss_weight must be non-negative, got {self.pose_recon_loss_weight}."
+                )
+            if self.action_mode != "continuous":
+                raise ValueError("MolmoAct2 enable_goal_pose requires action_mode='continuous'.")
+            needs_target = self.goal_token_source == "se3_encoder" or self.enable_pose_reconstruction
+            if needs_target and (self.target_pose_delta_index is None or self.target_pose_delta_index < 1):
+                raise ValueError(
+                    "enable_goal_pose with goal_token_source='se3_encoder' or "
+                    "enable_pose_reconstruction=true requires target_pose_delta_index >= 1 "
+                    "(e.g. chunk_size for s_{t+H})."
+                )
+            if self.goal_token_source == "se3_encoder" and self.enable_pose_reconstruction:
+                raise ValueError(
+                    "goal_token_source='se3_encoder' (Stage 1) does not use pose reconstruction; "
+                    "set enable_pose_reconstruction=false."
+                )
+        elif self.mask_image_from_action_expert or self.enable_pose_reconstruction:
+            raise ValueError(
+                "mask_image_from_action_expert / enable_pose_reconstruction require enable_goal_pose=true."
+            )
 
     def inferred_max_sequence_length(
         self,
@@ -279,6 +395,7 @@ class MolmoAct2Config(PreTrainedConfig):
             action_dim=int(action_dim),
             action_horizon=int(action_horizon),
             include_discrete_action=bool(include_discrete_action),
+            num_goal_tokens=int(self.num_goal_tokens) if self.enable_goal_pose else 0,
         )
 
     @property
@@ -308,6 +425,11 @@ class MolmoAct2Config(PreTrainedConfig):
             decay_lr=self.scheduler_decay_lr,
             num_warmup_steps=self.scheduler_warmup_steps,
             num_decay_steps=self.scheduler_decay_steps,
+            vlm_warmup_steps=self.scheduler_vlm_warmup_steps,
+            vit_warmup_steps=self.scheduler_vit_warmup_steps,
+            connector_warmup_steps=self.scheduler_connector_warmup_steps,
+            action_expert_warmup_steps=self.scheduler_action_expert_warmup_steps,
+            goal_warmup_steps=self.scheduler_goal_warmup_steps,
         )
 
     def set_dataset_feature_metadata(self, features: dict[str, Any]) -> None:

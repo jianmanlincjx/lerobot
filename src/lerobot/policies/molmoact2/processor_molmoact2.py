@@ -480,6 +480,8 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
     action_mode: str = "both"
     discrete_action_tokenizer: str = "allenai/MolmoAct2-FAST-Tokenizer"
     image_keys: list[str] = field(default_factory=list)
+    disable_visual_input: bool = False
+    enable_goal_pose: bool = False
     setup_type: str = ""
     control_mode: str = ""
     normalize_language: bool = True
@@ -527,6 +529,8 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
             "action_mode": self.action_mode,
             "discrete_action_tokenizer": self.discrete_action_tokenizer,
             "image_keys": list(self.image_keys),
+            "disable_visual_input": self.disable_visual_input,
+            "enable_goal_pose": self.enable_goal_pose,
             "setup_type": self.setup_type,
             "control_mode": self.control_mode,
             "normalize_language": self.normalize_language,
@@ -571,6 +575,8 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
         return 1
 
     def _resolve_image_keys(self, observation: dict[str, Any]) -> list[str]:
+        if self.disable_visual_input:
+            return []
         if self.image_keys:
             missing = [key for key in self.image_keys if key not in observation]
             if missing:
@@ -602,9 +608,35 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
         state = torch.as_tensor(observation[OBS_STATE], dtype=torch.float32)
         if state.ndim == 1:
             state = state.unsqueeze(0)
+        # With goal-pose enabled, observation.state carries a time axis (B, T, D) where index 0
+        # is the current frame and the last index is the chunk-end target. Use the current frame
+        # for discrete state prompting; the target is consumed separately by _extract_goal_pose.
+        if state.ndim == 3:
+            state = state[:, 0]
         if int(state.shape[0]) != batch_size:
             raise ValueError(f"State batch size {state.shape[0]} does not match batch size {batch_size}.")
         return state
+
+    def _extract_goal_pose(
+        self, observation: dict[str, Any], complementary: dict[str, Any], batch_size: int
+    ) -> tuple[Tensor, Tensor] | tuple[None, None]:
+        """Return (goal_pose, goal_pose_is_pad) from the chunk-end observation.state frame.
+
+        Requires observation.state loaded with a time axis (see resolve_delta_timestamps with
+        target_pose_delta_index). Returns (None, None) when no target frame is available (e.g.
+        at inference, where goal tokens come from learnable queries and no pose target exists).
+        """
+        state = torch.as_tensor(observation[OBS_STATE], dtype=torch.float32)
+        if state.ndim != 3 or state.shape[1] < 2:
+            return None, None
+        goal_pose = state[:, -1]  # normalized chunk-end target state vector (B, D)
+        state_is_pad = complementary.get("observation.state_is_pad")
+        if state_is_pad is not None:
+            pad = torch.as_tensor(state_is_pad, dtype=torch.bool)
+            goal_pose_is_pad = pad[:, -1] if pad.ndim == 2 else pad.reshape(-1)[:1].expand(batch_size)
+        else:
+            goal_pose_is_pad = torch.zeros(batch_size, dtype=torch.bool)
+        return goal_pose, goal_pose_is_pad
 
     def _pad_action(self, action: Tensor, action_is_pad: Any | None) -> tuple[Tensor, Tensor, Tensor]:
         if action.ndim == 2:
@@ -738,7 +770,12 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
                 full_texts.append(prompt)
 
         text = full_texts if build_action_labels else prompt_texts
-        inputs = self.processor(text=text, images=flat_images, return_tensors="pt", padding=True)
+        inputs = self.processor(
+            text=text,
+            images=flat_images if flat_images else None,
+            return_tensors="pt",
+            padding=True,
+        )
         if action is None:
             action_horizon = self.chunk_size
         elif action.ndim == 2:
@@ -765,6 +802,12 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
         complementary["action_dim_is_pad"] = action_dim_is_pad
         if action_horizon_is_pad is not None:
             complementary["action_horizon_is_pad"] = action_horizon_is_pad
+
+        if self.enable_goal_pose:
+            goal_pose, goal_pose_is_pad = self._extract_goal_pose(observation, complementary, batch_size)
+            if goal_pose is not None:
+                complementary["goal_pose"] = goal_pose
+                complementary["goal_pose_is_pad"] = goal_pose_is_pad
 
         if action_padded is not None:
             transition[TransitionKey.ACTION] = action_padded
@@ -845,6 +888,8 @@ def make_molmoact2_pre_post_processors(
             action_mode=config.action_mode,
             discrete_action_tokenizer=config.discrete_action_tokenizer,
             image_keys=image_keys,
+            disable_visual_input=config.disable_visual_input,
+            enable_goal_pose=config.enable_goal_pose,
             setup_type=setup_type,
             control_mode=control_mode,
             normalize_language=config.normalize_language,

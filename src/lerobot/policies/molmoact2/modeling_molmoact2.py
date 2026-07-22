@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import os
 import types
 from collections import defaultdict, deque
@@ -13,6 +15,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import torch.utils.checkpoint
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from torch import Tensor
 from torch.distributions import Beta
 
@@ -113,6 +116,56 @@ def _torch_dtype(dtype: str) -> torch.dtype:
     if dtype == "float16":
         return torch.float16
     raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def _module_fingerprint(module: torch.nn.Module) -> str:
+    """Cheap deterministic fingerprint for auditing initialization/weight transfer."""
+    digest = hashlib.sha256()
+    for name, tensor in module.state_dict().items():
+        value = tensor.detach().reshape(-1).cpu()
+        digest.update(name.encode())
+        digest.update(str(tuple(tensor.shape)).encode())
+        if value.numel():
+            sample = torch.cat((value[:16], value[-16:])).to(dtype=torch.float32)
+            digest.update(sample.numpy().tobytes())
+    return digest.hexdigest()
+
+
+class _GoalSE3Encoder(torch.nn.Module):
+    """Maps a (normalized) target-pose vector to K continuous goal tokens (Stage 1)."""
+
+    def __init__(self, pose_dim: int, num_tokens: int, hidden_size: int, inner_dim: int):
+        super().__init__()
+        self.num_tokens = int(num_tokens)
+        self.hidden_size = int(hidden_size)
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(pose_dim, inner_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(inner_dim, inner_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(inner_dim, self.num_tokens * self.hidden_size),
+        )
+
+    def forward(self, pose: Tensor) -> Tensor:
+        out = self.net(pose)
+        return out.view(pose.shape[0], self.num_tokens, self.hidden_size)
+
+
+class _GoalPoseDecoder(torch.nn.Module):
+    """Reconstructs the target-pose vector from the K goal-token hidden states (Stage 2)."""
+
+    def __init__(self, num_tokens: int, hidden_size: int, pose_dim: int, inner_dim: int):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(int(num_tokens) * int(hidden_size), inner_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(inner_dim, inner_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(inner_dim, pose_dim),
+        )
+
+    def forward(self, goal_hidden: Tensor) -> Tensor:
+        return self.net(goal_hidden.reshape(goal_hidden.shape[0], -1))
 
 
 def _sample_beta_timesteps(
@@ -626,6 +679,12 @@ class MolmoAct2Policy(PreTrainedPolicy):
         **kwargs,
     ):
         super().__init__(config, *inputs, **kwargs)
+        if getattr(self.config, "pretrained_path", None):
+            # A LeRobot checkpoint is self-contained. Bootstrap settings describe
+            # how the canonical artifact was made, not how descendants should load.
+            self.config.vlm_checkpoint_path = None
+            self.config.randomize_action_expert = False
+            self.config.audit_bootstrap = False
         self._checkpoint_action_mode = self._load_saved_policy_action_mode()
         self._apply_norm_tag_metadata()
         self.config.validate_features()
@@ -696,6 +755,109 @@ class MolmoAct2Policy(PreTrainedPolicy):
         if not self.config.image_keys and isinstance(metadata.get("camera_keys"), list):
             self.config.image_keys = [str(key) for key in metadata["camera_keys"]]
 
+    def _load_vlm_bootstrap_weights(self) -> dict[str, Any]:
+        """Overlay Molmo2-ER VLM tensors without touching the action expert."""
+        checkpoint_location = Path(
+            _resolve_checkpoint_location(
+                str(self.config.vlm_checkpoint_path),
+                revision=self.config.vlm_checkpoint_revision,
+                force_download=bool(self.config.vlm_checkpoint_force_download),
+            )
+        )
+        index_path = checkpoint_location / "model.safetensors.index.json"
+        if index_path.exists():
+            weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+            shard_names = sorted(set(str(name) for name in weight_map.values()))
+        elif (checkpoint_location / "model.safetensors").exists():
+            shard_names = ["model.safetensors"]
+        else:
+            raise FileNotFoundError(
+                f"VLM bootstrap checkpoint has no safetensors weights: {checkpoint_location}"
+            )
+
+        target_state = self.model.state_dict()
+        loaded = 0
+        partial = 0
+        skipped: list[str] = []
+        seen: set[str] = set()
+        with torch.no_grad():
+            for shard_name in shard_names:
+                with safe_open(checkpoint_location / shard_name, framework="pt", device="cpu") as shard:
+                    for name in shard.keys():
+                        if "action_expert" in name:
+                            raise ValueError(
+                                f"VLM bootstrap unexpectedly contains action-expert tensor {name!r}."
+                            )
+                        seen.add(name)
+                        target = target_state.get(name)
+                        if target is None:
+                            skipped.append(name)
+                            continue
+                        source = shard.get_tensor(name)
+                        if tuple(source.shape) == tuple(target.shape):
+                            target.copy_(source.to(device=target.device, dtype=target.dtype))
+                            loaded += 1
+                            continue
+                        # MolmoAct2 extends Molmo2-ER's vocabulary with robot tokens.
+                        # Copy the pretrained vocabulary prefix and preserve template-only rows.
+                        if (
+                            source.ndim == target.ndim
+                            and source.ndim >= 1
+                            and tuple(source.shape[1:]) == tuple(target.shape[1:])
+                            and source.shape[0] < target.shape[0]
+                        ):
+                            target[: source.shape[0]].copy_(
+                                source.to(device=target.device, dtype=target.dtype)
+                            )
+                            partial += 1
+                            continue
+                        skipped.append(name)
+
+        target_parameters = dict(self.model.named_parameters())
+        missing = sorted(
+            name
+            for name in target_parameters
+            if "action_expert" not in name and name not in seen
+        )
+        if skipped or missing:
+            raise ValueError(
+                "Unsafe Molmo2-ER bootstrap mismatch: "
+                f"skipped={skipped[:10]} (n={len(skipped)}), "
+                f"missing_non_action={missing[:10]} (n={len(missing)})."
+            )
+        return {
+            "checkpoint": str(checkpoint_location),
+            "loaded_exact": loaded,
+            "loaded_partial": partial,
+            "source_tensors": len(seen),
+        }
+
+    def _apply_clean_bootstrap(self) -> None:
+        if not self.config.vlm_checkpoint_path:
+            return
+        # LeRobot checkpoints contain the complete policy state. Their weights are
+        # overlaid immediately after construction by PreTrainedPolicy.from_pretrained,
+        # so repeating the bootstrap here is both wasteful and misleading in logs.
+        if getattr(self.config, "pretrained_path", None):
+            return
+        before = _module_fingerprint(self._action_expert())
+        audit = self._load_vlm_bootstrap_weights()
+        self._action_expert().reset_parameters()
+        after = _module_fingerprint(self._action_expert())
+        if before == after:
+            raise RuntimeError(
+                "Action-expert reset did not change its fingerprint; refusing an ambiguous bootstrap."
+            )
+        audit.update(
+            {
+                "action_expert_template_fingerprint": before,
+                "action_expert_random_fingerprint": after,
+            }
+        )
+        self.bootstrap_audit = audit
+        if self.config.audit_bootstrap:
+            logging.info("MolmoAct2 clean bootstrap audit: %s", json.dumps(audit, sort_keys=True))
+
     def _load_hf_model(self) -> None:
         require_package("transformers", extra="molmoact2")
         from transformers import AutoModelForImageTextToText
@@ -713,6 +875,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
             low_cpu_mem_usage=True,
             token=_hf_token(),
         )
+        self._apply_clean_bootstrap()
         hf_max_action_dim = int(getattr(self.model.config, "max_action_dim", -1))
         if hf_max_action_dim != int(self.config.expected_max_action_dim):
             raise ValueError(
@@ -748,6 +911,9 @@ class MolmoAct2Policy(PreTrainedPolicy):
             getattr(self.model.config, "add_action_expert", False)
         ):
             raise ValueError("Continuous MolmoAct2 training requires an action expert checkpoint.")
+
+        if self.config.enable_goal_pose:
+            self._build_goal_pose_modules(model_dtype)
 
         if self.config.freeze_embedding:
             self._freeze_input_embeddings()
@@ -798,6 +964,52 @@ class MolmoAct2Policy(PreTrainedPolicy):
     def _action_expert(self) -> torch.nn.Module:
         return self._backbone()._require_action_expert()
 
+    def _resolve_backbone_hidden_size(self) -> int:
+        backbone = self._backbone()
+        for cfg in (getattr(backbone, "config", None), getattr(self._hf_model(), "config", None)):
+            if cfg is None:
+                continue
+            for attr in ("hidden_size", "d_model"):
+                value = getattr(cfg, attr, None)
+                if value:
+                    return int(value)
+            text_cfg = getattr(cfg, "text_config", None)
+            if text_cfg is not None and getattr(text_cfg, "hidden_size", None):
+                return int(text_cfg.hidden_size)
+        transformer = getattr(backbone, "transformer", None)
+        wte = getattr(transformer, "wte", None)
+        embedding = getattr(wte, "embedding", None)
+        if embedding is not None:
+            return int(embedding.shape[-1])
+        raise RuntimeError("Could not resolve MolmoAct2 backbone hidden size for goal-pose modules.")
+
+    def _goal_pose_dim(self) -> int:
+        feature = self.config.robot_state_feature
+        pose_dim = int(feature.shape[0]) if feature is not None and feature.shape else 0
+        if pose_dim < 1:
+            raise ValueError(
+                "enable_goal_pose requires a positive observation.state dimension; "
+                "none was found in policy input_features."
+            )
+        return pose_dim
+
+    def _build_goal_pose_modules(self, model_dtype: torch.dtype) -> None:
+        hidden = self._resolve_backbone_hidden_size()
+        pose_dim = self._goal_pose_dim()
+        num_tokens = int(self.config.num_goal_tokens)
+        inner = int(self.config.goal_hidden_dim)
+        self._goal_hidden_size = hidden
+        self._goal_pose_dim_cached = pose_dim
+        self.goal_se3_encoder = _GoalSE3Encoder(pose_dim, num_tokens, hidden, inner).to(dtype=model_dtype)
+        self.goal_pose_decoder = _GoalPoseDecoder(num_tokens, hidden, pose_dim, inner).to(dtype=model_dtype)
+        query = torch.empty(num_tokens, hidden)
+        torch.nn.init.trunc_normal_(query, std=0.02)
+        self.goal_queries = torch.nn.Parameter(query.to(dtype=model_dtype))
+        if self.config.init_queries_from_se3_encoder:
+            with torch.no_grad():
+                canonical = torch.zeros(1, pose_dim, dtype=model_dtype)
+                self.goal_queries.copy_(self.goal_se3_encoder(canonical)[0])
+
     def _enable_gradient_checkpointing(self) -> None:
         enable_gradient_checkpointing = getattr(self._hf_model(), "gradient_checkpointing_enable", None)
         if callable(enable_gradient_checkpointing):
@@ -816,9 +1028,11 @@ class MolmoAct2Policy(PreTrainedPolicy):
             transformer.gradient_checkpointing = True
 
     def _freeze_non_action_expert_parameters(self) -> None:
+        # Goal-pose modules (SE(3) encoder / queries / decoder) live on the policy, not the
+        # backbone; keep them trainable in Stage 1 so the vision-free prior can learn.
         trainable_params = 0
         for name, param in self.named_parameters():
-            param.requires_grad = "action_expert" in name
+            param.requires_grad = ("action_expert" in name) or ("goal_" in name)
             if param.requires_grad:
                 trainable_params += param.numel()
         if trainable_params == 0:
@@ -873,11 +1087,14 @@ class MolmoAct2Policy(PreTrainedPolicy):
         vit_params: list[Tensor] = []
         connector_params: list[Tensor] = []
         action_expert_params: list[Tensor] = []
+        goal_params: list[Tensor] = []
         vlm_params: list[Tensor] = []
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
-            if "action_expert" in name:
+            if "goal_" in name:
+                goal_params.append(param)
+            elif "action_expert" in name:
                 action_expert_params.append(param)
             elif any(part in name for part in ("image_pooling_2d", "image_projector")):
                 connector_params.append(param)
@@ -894,14 +1111,48 @@ class MolmoAct2Policy(PreTrainedPolicy):
 
         groups: list[dict[str, Any]] = []
         if vlm_params:
-            groups.append({"params": vlm_params, "lr": vlm_lr})
+            groups.append({"params": vlm_params, "lr": vlm_lr, "name": "vlm"})
         if vit_params:
-            groups.append({"params": vit_params, "lr": vit_lr})
+            groups.append({"params": vit_params, "lr": vit_lr, "name": "vit"})
         if connector_params:
-            groups.append({"params": connector_params, "lr": connector_lr})
+            groups.append({"params": connector_params, "lr": connector_lr, "name": "connector"})
         if action_expert_params:
-            groups.append({"params": action_expert_params, "lr": self.config.optimizer_action_expert_lr})
+            groups.append(
+                {
+                    "params": action_expert_params,
+                    "lr": self.config.optimizer_action_expert_lr,
+                    "name": "action_expert",
+                }
+            )
+        if goal_params:
+            groups.append(
+                {
+                    "params": goal_params,
+                    "lr": self.config.optimizer_goal_lr,
+                    "name": "goal",
+                }
+            )
         return groups
+
+    def training_audit(self) -> dict[str, Any]:
+        group_counts: dict[str, int] = {}
+        for group in self.get_optim_params():
+            group_counts[str(group.get("name", "unnamed"))] = sum(
+                parameter.numel() for parameter in group["params"]
+            )
+        return {
+            "action_expert_fingerprint": _module_fingerprint(self._action_expert()),
+            "disable_visual_input": bool(self.config.disable_visual_input),
+            "train_action_expert_only": bool(self.config.train_action_expert_only),
+            "enable_goal_pose": bool(self.config.enable_goal_pose),
+            "goal_token_source": self.config.goal_token_source,
+            "num_goal_tokens": int(self.config.num_goal_tokens) if self.config.enable_goal_pose else 0,
+            "mask_image_from_action_expert": bool(self.config.mask_image_from_action_expert),
+            "enable_pose_reconstruction": bool(self.config.enable_pose_reconstruction),
+            "trainable_parameter_groups": group_counts,
+            "trainable_parameters": sum(group_counts.values()),
+            "total_parameters": sum(parameter.numel() for parameter in self.parameters()),
+        }
 
     def _model_inputs(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         compute_dtype = _torch_dtype(self.config.model_dtype)
@@ -982,11 +1233,23 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 end_ptr += 1
         return mask
 
+    def _image_token_ids(self) -> set[int]:
+        ids: set[int] = set()
+        for cfg in (getattr(self.model, "config", None), getattr(self._backbone(), "config", None)):
+            if cfg is None:
+                continue
+            for attr in ("image_patch_id", "image_low_res_id"):
+                value = getattr(cfg, attr, None)
+                if value is not None:
+                    ids.add(int(value))
+        return ids
+
     def _encoder_attention_mask_for_action_expert(
         self,
         *,
         input_ids: Tensor | None,
         attention_mask: Tensor | None,
+        num_goal_tokens: int = 0,
     ) -> Tensor | None:
         backbone = self._backbone()
         get_encoder_attention_mask = getattr(backbone, "_get_encoder_attention_mask", None)
@@ -997,21 +1260,42 @@ class MolmoAct2Policy(PreTrainedPolicy):
         elif input_ids is not None:
             mask = input_ids != -1
         else:
-            return None
+            mask = None
 
-        if getattr(self.config, "action_mode", None) != "both" or input_ids is None or mask is None:
-            return mask
+        if mask is not None and getattr(self.config, "action_mode", None) == "both" and input_ids is not None:
+            mask = mask.to(dtype=torch.bool).clone()
+            eos_token_id = getattr(self.model.config, "eos_token_id", None)
+            if eos_token_id is not None:
+                mask &= input_ids != int(eos_token_id)
+            mask = self._mask_discrete_action_spans(
+                input_ids=input_ids,
+                mask=mask,
+                start_token_id=getattr(self.model.config, "action_start_token_id", None),
+                end_token_id=getattr(self.model.config, "action_end_token_id", None),
+            )
 
-        mask = mask.to(dtype=torch.bool).clone()
-        eos_token_id = getattr(self.model.config, "eos_token_id", None)
-        if eos_token_id is not None:
-            mask &= input_ids != int(eos_token_id)
-        return self._mask_discrete_action_spans(
-            input_ids=input_ids,
-            mask=mask,
-            start_token_id=getattr(self.model.config, "action_start_token_id", None),
-            end_token_id=getattr(self.model.config, "action_end_token_id", None),
-        )
+        # Goal-pose steering: hide raw image tokens from the action expert so visual
+        # information reaches it only through the appended goal tokens.
+        if (
+            mask is not None
+            and getattr(self.config, "mask_image_from_action_expert", False)
+            and input_ids is not None
+        ):
+            image_ids = self._image_token_ids()
+            if image_ids:
+                mask = mask.to(dtype=torch.bool).clone()
+                for token_id in image_ids:
+                    mask &= input_ids != token_id
+
+        # The K goal tokens are appended at the end of the sequence and are always visible.
+        if mask is not None and num_goal_tokens > 0:
+            mask = mask.to(dtype=torch.bool)
+            goal_cols = torch.ones(
+                mask.shape[0], int(num_goal_tokens), device=mask.device, dtype=torch.bool
+            )
+            mask = torch.cat([mask, goal_cols], dim=1)
+
+        return mask
 
     @staticmethod
     def _drop_trivial_attention_mask(model_inputs: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -1219,9 +1503,33 @@ class MolmoAct2Policy(PreTrainedPolicy):
         target_velocity = actions_expanded - noise
         return actions, timesteps, xt, target_velocity
 
+    def _goal_token_embeddings(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        """Return (B, K, hidden) goal-token embeddings, or None when goal-pose is disabled."""
+        if not self.config.enable_goal_pose:
+            return None
+        if self.config.goal_token_source == "se3_encoder":
+            goal_pose = batch.get("goal_pose")
+            if goal_pose is None:
+                raise ValueError(
+                    "goal_token_source='se3_encoder' requires batch['goal_pose']; ensure "
+                    "target_pose_delta_index is set so the chunk-end state is loaded."
+                )
+            goal_pose = goal_pose.to(device=device, dtype=dtype)
+            return self.goal_se3_encoder(goal_pose)
+        queries = self.goal_queries.to(device=device, dtype=dtype)
+        return queries.unsqueeze(0).expand(batch_size, -1, -1)
+
     def _prepare_joint_training_backbone_inputs(
         self,
         model_inputs: dict[str, Tensor],
+        goal_embeds: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | dict[str, Any], Tensor, Tensor]:
         backbone = self._backbone()
         input_ids = model_inputs.get("input_ids")
@@ -1256,19 +1564,44 @@ class MolmoAct2Policy(PreTrainedPolicy):
         if inputs_embeds is None:
             inputs_embeds, _image_features = backbone.build_input_embeddings(input_ids, images, token_pooling)
 
+        attention_mask = model_inputs.get("attention_mask")
+        token_type_ids = model_inputs.get("token_type_ids")
+        # Append the K goal tokens to the end of the sequence. Positions/masks below derive
+        # from the extended length so the backbone (and per-layer KV the action expert reads)
+        # naturally covers the goal tokens.
+        if goal_embeds is not None:
+            goal_embeds = goal_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            num_goal = int(goal_embeds.shape[1])
+            inputs_embeds = torch.cat([inputs_embeds, goal_embeds], dim=1)
+            if attention_mask is not None and not isinstance(attention_mask, dict):
+                pad = torch.ones(
+                    attention_mask.shape[0],
+                    num_goal,
+                    device=attention_mask.device,
+                    dtype=attention_mask.dtype,
+                )
+                attention_mask = torch.cat([attention_mask, pad], dim=1)
+            if token_type_ids is not None:
+                type_pad = torch.zeros(
+                    token_type_ids.shape[0],
+                    num_goal,
+                    device=token_type_ids.device,
+                    dtype=token_type_ids.dtype,
+                )
+                token_type_ids = torch.cat([token_type_ids, type_pad], dim=1)
+
         cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
         position_ids = model_inputs.get("position_ids")
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        attention_mask = model_inputs.get("attention_mask")
         if isinstance(attention_mask, dict):
             causal_mask_mapping = attention_mask
         else:
             causal_mask_mapping = backbone._build_native_attention_bias(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                token_type_ids=model_inputs.get("token_type_ids"),
+                token_type_ids=token_type_ids,
                 past_key_values=None,
             )
         return inputs_embeds, causal_mask_mapping, position_ids, cache_position
@@ -1320,8 +1653,15 @@ class MolmoAct2Policy(PreTrainedPolicy):
         xt_flat = xt.reshape(batch_size * num_flow_timesteps, actions.shape[1], actions.shape[2])
         timesteps_flat = timesteps.reshape(batch_size * num_flow_timesteps)
 
+        goal_embeds = self._goal_token_embeddings(
+            batch,
+            batch_size=batch_size,
+            device=device,
+            dtype=next(self.model.parameters()).dtype,
+        )
+        num_goal_tokens = int(goal_embeds.shape[1]) if goal_embeds is not None else 0
         hidden_states, causal_mask_mapping, position_ids, cache_position = (
-            self._prepare_joint_training_backbone_inputs(model_inputs)
+            self._prepare_joint_training_backbone_inputs(model_inputs, goal_embeds=goal_embeds)
         )
         if hidden_states.shape[0] != batch_size:
             raise ValueError(
@@ -1331,6 +1671,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
         encoder_attention_mask = self._encoder_attention_mask_for_action_expert(
             input_ids=model_inputs.get("input_ids"),
             attention_mask=model_inputs.get("attention_mask"),
+            num_goal_tokens=num_goal_tokens,
         )
         action_attention_mask = None
         if batch.get("action_horizon_is_pad") is not None:
@@ -1807,16 +2148,12 @@ class MolmoAct2Policy(PreTrainedPolicy):
     ) -> Tensor:
         backbone = self._backbone()
         action_expert = self._action_expert()
-        outputs = backbone(
-            **model_inputs,
-            use_cache=True,
-            output_attentions=False,
-            output_hidden_states=False,
-        )
+        outputs, num_goal_tokens = self._backbone_prefill_outputs(model_inputs)
         encoder_kv_states = backbone._extract_kv_states(outputs.past_key_values)
         encoder_attention_mask = self._encoder_attention_mask_for_action_expert(
             input_ids=model_inputs.get("input_ids"),
             attention_mask=model_inputs.get("attention_mask"),
+            num_goal_tokens=num_goal_tokens,
         )
         depth_gate, depth_mask = backbone._depth_gate_from_condition(
             input_ids=model_inputs.get("input_ids"),
@@ -1908,6 +2245,94 @@ class MolmoAct2Policy(PreTrainedPolicy):
 
         return trajectory
 
+    def _backbone_prefill_outputs(self, model_inputs: dict[str, Tensor]) -> tuple[Any, int]:
+        """Run the VLM prefill, injecting goal tokens (Stage 2 uses learnable queries).
+
+        Returns (outputs, num_goal_tokens). When goal-pose is disabled this is the plain
+        backbone prefill. With goal-pose enabled, goal embeddings are appended at the
+        embedding level (input_ids and inputs_embeds are mutually exclusive on the backbone).
+        """
+        backbone = self._backbone()
+        if not getattr(self.config, "enable_goal_pose", False):
+            outputs = backbone(
+                **model_inputs,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+            return outputs, 0
+
+        input_ids = model_inputs.get("input_ids")
+        batch_size = int(input_ids.shape[0])
+        device = input_ids.device
+        dtype = next(self.model.parameters()).dtype
+        goal_embeds = self._goal_token_embeddings(
+            {}, batch_size=batch_size, device=device, dtype=dtype
+        )
+
+        images = None
+        token_pooling = None
+        merge_visual_inputs = getattr(backbone, "merge_visual_inputs", None)
+        if callable(merge_visual_inputs):
+            images, token_pooling = merge_visual_inputs(
+                input_ids=input_ids,
+                pixel_values=model_inputs.get("pixel_values"),
+                image_token_pooling=model_inputs.get("image_token_pooling"),
+                image_grids=model_inputs.get("image_grids"),
+                image_num_crops=model_inputs.get("image_num_crops"),
+                pixel_values_videos=model_inputs.get("pixel_values_videos"),
+                video_token_pooling=model_inputs.get("video_token_pooling"),
+                video_grids=model_inputs.get("video_grids"),
+            )
+        inputs_embeds, _image_features = backbone.build_input_embeddings(input_ids, images, token_pooling)
+
+        attention_mask = model_inputs.get("attention_mask")
+        num_goal = 0
+        if goal_embeds is not None:
+            goal_embeds = goal_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            num_goal = int(goal_embeds.shape[1])
+            inputs_embeds = torch.cat([inputs_embeds, goal_embeds], dim=1)
+            if attention_mask is not None:
+                pad = torch.ones(
+                    attention_mask.shape[0], num_goal, device=attention_mask.device, dtype=attention_mask.dtype
+                )
+                attention_mask = torch.cat([attention_mask, pad], dim=1)
+
+        outputs = backbone(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            token_type_ids=model_inputs.get("token_type_ids"),
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+        return outputs, num_goal
+
+    def _compute_pose_reconstruction_loss(
+        self, batch: dict[str, Tensor], hidden_states: Tensor
+    ) -> Tensor | None:
+        """Reconstruct the target pose from the appended goal-token hidden states (L_pose).
+
+        The K goal tokens sit at the end of the sequence, so their contextualized hidden
+        states are the last K rows of the backbone output. Returns None when goal-pose
+        reconstruction is disabled or no pose target is present (e.g. at inference).
+        """
+        if not (self.config.enable_goal_pose and self.config.enable_pose_reconstruction):
+            return None
+        goal_pose = batch.get("goal_pose")
+        if goal_pose is None:
+            return None
+        num_tokens = int(self.config.num_goal_tokens)
+        goal_hidden = hidden_states[:, -num_tokens:, :]
+        pred = self.goal_pose_decoder(goal_hidden).float()
+        target = goal_pose.to(device=pred.device, dtype=pred.dtype)
+        per_sample = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
+        is_pad = batch.get("goal_pose_is_pad")
+        if is_pad is not None:
+            valid = (~is_pad.to(device=per_sample.device, dtype=torch.bool)).to(per_sample.dtype)
+            return (per_sample * valid).sum() / valid.sum().clamp_min(1.0)
+        return per_sample.mean()
+
     def forward(
         self,
         batch: dict[str, Tensor],
@@ -1938,13 +2363,17 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 metrics["discrete_z_loss"] = discrete_z_loss.detach().float().mean().item()
 
         elif self.config.action_mode == "continuous":
-            flow_loss, _ = self._compute_flow_matching_loss_joint_per_layer(
+            flow_loss, hidden_states = self._compute_flow_matching_loss_joint_per_layer(
                 batch=batch,
                 model_inputs=model_inputs,
                 reduction=reduction,
             )
             losses.append(flow_loss)
             metrics["action_flow_loss"] = flow_loss.detach().float().mean().item()
+            pose_loss = self._compute_pose_reconstruction_loss(batch, hidden_states)
+            if pose_loss is not None:
+                losses.append(self.config.pose_recon_loss_weight * pose_loss)
+                metrics["pose_recon_loss"] = pose_loss.detach().float().mean().item()
 
         else:
             flow_loss, hidden_states = self._compute_flow_matching_loss_joint_per_layer(

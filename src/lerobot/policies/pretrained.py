@@ -106,10 +106,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             )
         model_id = str(pretrained_name_or_path)
         instance = cls(config, **kwargs)
+        load_device = cls._distributed_load_device(config.device)
         if os.path.isdir(model_id):
             print("Loading weights from local directory")
             model_file = os.path.join(model_id, SAFETENSORS_SINGLE_FILE)
-            policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
+            policy = cls._load_as_safetensor(instance, model_file, load_device, strict)
         else:
             try:
                 model_file = hf_hub_download(
@@ -123,15 +124,23 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                     token=token,
                     local_files_only=local_files_only,
                 )
-                policy = cls._load_as_safetensor(instance, model_file, config.device, strict)
+                policy = cls._load_as_safetensor(instance, model_file, load_device, strict)
             except HfHubHTTPError as e:
                 raise FileNotFoundError(
                     f"{SAFETENSORS_SINGLE_FILE} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        policy.to(config.device)
+        policy.to(load_device)
         policy.eval()
         return policy
+
+    @staticmethod
+    def _distributed_load_device(config_device: str) -> str:
+        """Resolve bare CUDA to this worker's local device before loading weights."""
+        local_rank = os.environ.get("LOCAL_RANK")
+        if config_device == "cuda" and local_rank is not None:
+            return f"cuda:{int(local_rank)}"
+        return config_device
 
     @classmethod
     def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:

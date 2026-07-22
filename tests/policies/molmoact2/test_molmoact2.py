@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F  # noqa: N812
+from safetensors.torch import save_file
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies import get_policy_class, make_policy_config
@@ -62,6 +63,250 @@ def test_molmoact2_scheduler_decay_steps_auto_match_training_steps():
         scheduler.step()
 
     assert scheduler.get_last_lr() == pytest.approx([0.0001])
+
+
+def test_molmoact2_scheduler_uses_independent_group_warmups():
+    params = [torch.nn.Parameter(torch.ones(())) for _ in range(2)]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [params[0]], "lr": 1e-5, "name": "vlm"},
+            {"params": [params[1]], "lr": 5e-5, "name": "action_expert"},
+        ]
+    )
+    config = MolmoAct2CosineDecayWithWarmupSchedulerConfig(
+        peak_lr=1e-5,
+        decay_lr=1e-6,
+        num_warmup_steps=10,
+        num_decay_steps=100,
+        vlm_warmup_steps=10,
+        action_expert_warmup_steps=2,
+    )
+
+    scheduler = config.build(optimizer, num_training_steps=100)
+
+    assert scheduler.get_last_lr() == pytest.approx([1e-5 / 11, 5e-5 / 3])
+    for _ in range(2):
+        optimizer.step()
+        scheduler.step()
+    assert scheduler.get_last_lr()[1] == pytest.approx(5e-5)
+    assert scheduler.get_last_lr()[0] < 1e-5
+
+
+def test_clean_vlm_bootstrap_loads_vlm_and_resets_action_expert(tmp_path, monkeypatch):
+    class DummyActionExpert(torch.nn.Linear):
+        def reset_parameters(self):
+            torch.nn.init.constant_(self.weight, 0.25)
+            if self.bias is not None:
+                torch.nn.init.zeros_(self.bias)
+
+    class DummyBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.body = torch.nn.Linear(2, 2, bias=False)
+            self.embedding = torch.nn.Parameter(torch.zeros(4, 2))
+            self.action_expert = DummyActionExpert(2, 2)
+
+        def _require_action_expert(self):
+            return self.action_expert
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = DummyBackbone()
+
+    save_file(
+        {
+            "model.body.weight": torch.full((2, 2), 3.0),
+            "model.embedding": torch.full((3, 2), 4.0),
+        },
+        tmp_path / "model.safetensors",
+    )
+    monkeypatch.setattr(
+        molmoact2_modeling,
+        "_resolve_checkpoint_location",
+        lambda checkpoint_path, **kwargs: str(tmp_path),
+    )
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+    policy.model = DummyModel()
+    torch.nn.init.constant_(policy.model.model.action_expert.weight, 9.0)
+    policy.config = SimpleNamespace(
+        vlm_checkpoint_path=str(tmp_path),
+        vlm_checkpoint_revision=None,
+        vlm_checkpoint_force_download=False,
+        audit_bootstrap=False,
+    )
+
+    policy._apply_clean_bootstrap()
+
+    assert torch.equal(policy.model.model.body.weight, torch.full((2, 2), 3.0))
+    assert torch.equal(policy.model.model.embedding[:3], torch.full((3, 2), 4.0))
+    assert torch.equal(policy.model.model.embedding[3], torch.zeros(2))
+    assert torch.equal(policy.model.model.action_expert.weight, torch.full((2, 2), 0.25))
+    assert policy.bootstrap_audit["loaded_exact"] == 1
+    assert policy.bootstrap_audit["loaded_partial"] == 1
+
+
+def test_disable_visual_input_does_not_require_camera_keys():
+    step = object.__new__(MolmoAct2PackInputsProcessorStep)
+    step.disable_visual_input = True
+    step.image_keys = ["observation.images.image", "observation.images.image2"]
+
+    assert step._resolve_image_keys({OBS_STATE: torch.zeros(1, 7)}) == []
+
+
+def test_goal_pose_config_validation_and_scheduler_group():
+    with pytest.raises(ValueError):
+        # se3_encoder source needs a target_pose_delta_index.
+        MolmoAct2Config(
+            checkpoint_path="/tmp/x",
+            action_mode="continuous",
+            enable_goal_pose=True,
+            goal_token_source="se3_encoder",
+        )
+    with pytest.raises(ValueError):
+        # mask_image / pose reconstruction require enable_goal_pose.
+        MolmoAct2Config(checkpoint_path="/tmp/x", mask_image_from_action_expert=True)
+
+    cfg = MolmoAct2Config(
+        checkpoint_path="/tmp/x",
+        action_mode="continuous",
+        enable_goal_pose=True,
+        goal_token_source="learnable_queries",
+        num_goal_tokens=4,
+        target_pose_delta_index=10,
+        enable_pose_reconstruction=True,
+        mask_image_from_action_expert=True,
+        scheduler_goal_warmup_steps=500,
+    )
+    assert cfg.enable_goal_pose
+    assert cfg.get_scheduler_preset().goal_warmup_steps == 500
+    assert cfg.target_pose_delta_index == 10
+
+
+def test_infer_max_sequence_length_accounts_for_goal_tokens():
+    base = infer_molmoact2_max_sequence_length(
+        num_images=2, state_dim=8, action_dim=7, action_horizon=10, include_discrete_action=False
+    )
+    with_goal = infer_molmoact2_max_sequence_length(
+        num_images=2,
+        state_dim=8,
+        action_dim=7,
+        action_horizon=10,
+        include_discrete_action=False,
+        num_goal_tokens=64,
+    )
+    assert with_goal >= base
+
+
+def test_goal_se3_encoder_and_decoder_shapes():
+    encoder = molmoact2_modeling._GoalSE3Encoder(pose_dim=8, num_tokens=4, hidden_size=16, inner_dim=32)
+    decoder = molmoact2_modeling._GoalPoseDecoder(num_tokens=4, hidden_size=16, pose_dim=8, inner_dim=32)
+
+    tokens = encoder(torch.randn(3, 8))
+    assert tokens.shape == (3, 4, 16)
+    assert decoder(tokens).shape == (3, 8)
+
+
+def test_goal_token_embeddings_from_queries_and_encoder():
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(enable_goal_pose=True, goal_token_source="learnable_queries")
+    policy.goal_queries = torch.nn.Parameter(torch.randn(4, 16))
+    queries = policy._goal_token_embeddings(
+        {}, batch_size=3, device=torch.device("cpu"), dtype=torch.float32
+    )
+    assert queries.shape == (3, 4, 16)
+
+    policy.config = SimpleNamespace(enable_goal_pose=True, goal_token_source="se3_encoder")
+    policy.goal_se3_encoder = molmoact2_modeling._GoalSE3Encoder(8, 4, 16, 32)
+    with pytest.raises(ValueError):
+        policy._goal_token_embeddings({}, batch_size=2, device=torch.device("cpu"), dtype=torch.float32)
+    encoded = policy._goal_token_embeddings(
+        {"goal_pose": torch.randn(2, 8)}, batch_size=2, device=torch.device("cpu"), dtype=torch.float32
+    )
+    assert encoded.shape == (2, 4, 16)
+
+
+def test_encoder_attention_mask_masks_image_and_appends_goal_tokens():
+    policy = object.__new__(MolmoAct2Policy)
+    policy.config = SimpleNamespace(action_mode="continuous", mask_image_from_action_expert=True)
+    policy.model = SimpleNamespace(
+        config=SimpleNamespace(image_patch_id=999, image_low_res_id=None, eos_token_id=None)
+    )
+    backbone = SimpleNamespace(config=SimpleNamespace())
+    policy._backbone = lambda: backbone
+
+    input_ids = torch.tensor([[5, 999, 999, 7]])
+    attention_mask = torch.ones(1, 4, dtype=torch.bool)
+    mask = policy._encoder_attention_mask_for_action_expert(
+        input_ids=input_ids, attention_mask=attention_mask, num_goal_tokens=2
+    )
+    assert mask.shape == (1, 6)
+    # image-patch positions hidden from the action expert, goal columns always visible.
+    assert mask[0].tolist() == [True, False, False, True, True, True]
+
+
+def test_pose_reconstruction_loss_honors_pad_mask():
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        enable_goal_pose=True, enable_pose_reconstruction=True, num_goal_tokens=4
+    )
+    policy.goal_pose_decoder = molmoact2_modeling._GoalPoseDecoder(4, 16, 8, 32)
+    hidden = torch.randn(2, 10, 16)
+    batch = {
+        "goal_pose": torch.randn(2, 8),
+        "goal_pose_is_pad": torch.tensor([False, True]),
+    }
+    loss = policy._compute_pose_reconstruction_loss(batch, hidden)
+    assert loss is not None and loss.ndim == 0
+
+    policy.config = SimpleNamespace(
+        enable_goal_pose=True, enable_pose_reconstruction=False, num_goal_tokens=4
+    )
+    assert policy._compute_pose_reconstruction_loss(batch, hidden) is None
+
+
+def test_extract_state_and_goal_pose_from_multi_frame_state():
+    step = object.__new__(MolmoAct2PackInputsProcessorStep)
+    step.enable_goal_pose = True
+    observation = {OBS_STATE: torch.randn(2, 3, 8)}
+
+    current = step._extract_state(observation, 2)
+    assert current.shape == (2, 8)
+    assert torch.equal(current, observation[OBS_STATE][:, 0])
+
+    complementary = {
+        "observation.state_is_pad": torch.tensor([[False, False, True], [False, False, False]])
+    }
+    goal_pose, goal_pose_is_pad = step._extract_goal_pose(observation, complementary, 2)
+    assert goal_pose.shape == (2, 8)
+    assert torch.equal(goal_pose, observation[OBS_STATE][:, -1])
+    assert goal_pose_is_pad.tolist() == [True, False]
+
+    # Single-frame state (inference) has no target frame.
+    assert step._extract_goal_pose({OBS_STATE: torch.randn(2, 8)}, {}, 2) == (None, None)
+
+
+def test_resolve_delta_timestamps_adds_target_state_frame_only():
+    from lerobot.datasets.factory import resolve_delta_timestamps
+
+    cfg = SimpleNamespace(
+        reward_delta_indices=None,
+        action_delta_indices=[0, 1, 2],
+        observation_delta_indices=None,
+        target_pose_delta_index=10,
+    )
+    ds_meta = SimpleNamespace(
+        features={"observation.state": {}, "observation.images.image": {}, "action": {}},
+        fps=10.0,
+    )
+    delta = resolve_delta_timestamps(cfg, ds_meta)
+    assert delta["action"] == pytest.approx([0.0, 0.1, 0.2])
+    assert delta["observation.state"] == pytest.approx([0.0, 1.0])
+    # Cameras stay single-frame (no future image loading).
+    assert "observation.images.image" not in delta
 
 
 def test_molmoact2_rollout_generator_uses_eval_seed_per_task():
