@@ -41,6 +41,7 @@ class MolmoAct2CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
     connector_warmup_steps: int | None = None
     action_expert_warmup_steps: int | None = None
     goal_warmup_steps: int | None = None
+    semantic_visual_warmup_steps: int | None = None
 
     def build(self, optimizer, num_training_steps: int):
         decay_steps = num_training_steps if self.num_decay_steps is None else self.num_decay_steps
@@ -53,6 +54,7 @@ class MolmoAct2CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
             "connector": self.connector_warmup_steps,
             "action_expert": self.action_expert_warmup_steps,
             "goal": self.goal_warmup_steps,
+            "semantic_visual": self.semantic_visual_warmup_steps,
         }
         lambdas = []
         for group in optimizer.param_groups:
@@ -178,6 +180,18 @@ class MolmoAct2Config(PreTrainedConfig):
     init_queries_from_se3_encoder: bool = False
     optimizer_goal_lr: float = 5e-5
     scheduler_goal_warmup_steps: int | None = None
+    # v2: a recurrent latent bottleneck shared across all VLM/AE layers. At each
+    # layer, the latent queries first cross-attend vision-fused language/state
+    # hidden states and then the image patch hidden states. The resulting tokens
+    # are appended to the AE context (not to the causal VLM sequence).
+    goal_conditioning_mode: str = "vlm_appended"
+    num_semantic_visual_tokens: int = 100
+    semantic_visual_hidden_dim: int = 768
+    semantic_visual_num_heads: int = 8
+    semantic_visual_ffn_ratio: float = 4.0
+    semantic_visual_dropout: float = 0.0
+    optimizer_semantic_visual_lr: float = 1e-5
+    scheduler_semantic_visual_warmup_steps: int | None = None
     normalize_language: bool = True
     add_setup_tokens: bool = True
     add_control_tokens: bool = True
@@ -328,6 +342,10 @@ class MolmoAct2Config(PreTrainedConfig):
             ("scheduler_connector_warmup_steps", self.scheduler_connector_warmup_steps),
             ("scheduler_action_expert_warmup_steps", self.scheduler_action_expert_warmup_steps),
             ("scheduler_goal_warmup_steps", self.scheduler_goal_warmup_steps),
+            (
+                "scheduler_semantic_visual_warmup_steps",
+                self.scheduler_semantic_visual_warmup_steps,
+            ),
         ):
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}.")
@@ -335,6 +353,37 @@ class MolmoAct2Config(PreTrainedConfig):
             raise ValueError(
                 f"Unsupported goal_token_source={self.goal_token_source!r}. "
                 "Expected 'se3_encoder' or 'learnable_queries'."
+            )
+        if self.goal_conditioning_mode not in {"vlm_appended", "semantic_visual_recurrent"}:
+            raise ValueError(
+                f"Unsupported goal_conditioning_mode={self.goal_conditioning_mode!r}. "
+                "Expected 'vlm_appended' or 'semantic_visual_recurrent'."
+            )
+        if self.num_semantic_visual_tokens < 1:
+            raise ValueError(
+                "num_semantic_visual_tokens must be >= 1, "
+                f"got {self.num_semantic_visual_tokens}."
+            )
+        if self.semantic_visual_hidden_dim < 1:
+            raise ValueError(
+                f"semantic_visual_hidden_dim must be >= 1, got {self.semantic_visual_hidden_dim}."
+            )
+        if self.semantic_visual_num_heads < 1:
+            raise ValueError(
+                f"semantic_visual_num_heads must be >= 1, got {self.semantic_visual_num_heads}."
+            )
+        if self.semantic_visual_hidden_dim % self.semantic_visual_num_heads != 0:
+            raise ValueError(
+                "semantic_visual_hidden_dim must be divisible by semantic_visual_num_heads, "
+                f"got {self.semantic_visual_hidden_dim} and {self.semantic_visual_num_heads}."
+            )
+        if self.semantic_visual_ffn_ratio <= 0:
+            raise ValueError(
+                f"semantic_visual_ffn_ratio must be > 0, got {self.semantic_visual_ffn_ratio}."
+            )
+        if not 0 <= self.semantic_visual_dropout <= 1:
+            raise ValueError(
+                f"semantic_visual_dropout must be in [0, 1], got {self.semantic_visual_dropout}."
             )
         if self.enable_goal_pose:
             if self.num_goal_tokens < 1:
@@ -357,9 +406,26 @@ class MolmoAct2Config(PreTrainedConfig):
                     "goal_token_source='se3_encoder' (Stage 1) does not use pose reconstruction; "
                     "set enable_pose_reconstruction=false."
                 )
-        elif self.mask_image_from_action_expert or self.enable_pose_reconstruction:
+            if self.goal_conditioning_mode == "semantic_visual_recurrent":
+                if self.goal_token_source != "learnable_queries":
+                    raise ValueError(
+                        "semantic_visual_recurrent requires goal_token_source='learnable_queries'."
+                    )
+                if self.disable_visual_input:
+                    raise ValueError("semantic_visual_recurrent requires visual input.")
+                if not self.mask_image_from_action_expert:
+                    raise ValueError(
+                        "semantic_visual_recurrent requires mask_image_from_action_expert=true; "
+                        "raw image KV must reach the AE only through the latent aggregator."
+                    )
+        elif (
+            self.mask_image_from_action_expert
+            or self.enable_pose_reconstruction
+            or self.goal_conditioning_mode == "semantic_visual_recurrent"
+        ):
             raise ValueError(
-                "mask_image_from_action_expert / enable_pose_reconstruction require enable_goal_pose=true."
+                "mask_image_from_action_expert / enable_pose_reconstruction / "
+                "semantic_visual_recurrent require enable_goal_pose=true."
             )
 
     def inferred_max_sequence_length(
@@ -395,7 +461,11 @@ class MolmoAct2Config(PreTrainedConfig):
             action_dim=int(action_dim),
             action_horizon=int(action_horizon),
             include_discrete_action=bool(include_discrete_action),
-            num_goal_tokens=int(self.num_goal_tokens) if self.enable_goal_pose else 0,
+            num_goal_tokens=(
+                int(self.num_goal_tokens)
+                if self.enable_goal_pose and self.goal_conditioning_mode == "vlm_appended"
+                else 0
+            ),
         )
 
     @property
@@ -430,6 +500,7 @@ class MolmoAct2Config(PreTrainedConfig):
             connector_warmup_steps=self.scheduler_connector_warmup_steps,
             action_expert_warmup_steps=self.scheduler_action_expert_warmup_steps,
             goal_warmup_steps=self.scheduler_goal_warmup_steps,
+            semantic_visual_warmup_steps=self.scheduler_semantic_visual_warmup_steps,
         )
 
     def set_dataset_feature_metadata(self, features: dict[str, Any]) -> None:

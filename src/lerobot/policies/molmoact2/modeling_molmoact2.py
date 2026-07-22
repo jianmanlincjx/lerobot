@@ -168,6 +168,128 @@ class _GoalPoseDecoder(torch.nn.Module):
         return self.net(goal_hidden.reshape(goal_hidden.shape[0], -1))
 
 
+class _SemanticVisualCrossAttentionBlock(torch.nn.Module):
+    """Pre-norm cross-attention + FFN update for the v2 recurrent latent tokens."""
+
+    def __init__(
+        self,
+        *,
+        latent_dim: int,
+        context_dim: int,
+        num_heads: int,
+        ffn_ratio: float,
+        dropout: float,
+    ):
+        super().__init__()
+        self.query_norm = torch.nn.LayerNorm(latent_dim)
+        self.context_norm = torch.nn.LayerNorm(context_dim)
+        self.cross_attn = torch.nn.MultiheadAttention(
+            embed_dim=latent_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            kdim=context_dim,
+            vdim=context_dim,
+            batch_first=True,
+        )
+        inner = max(1, int(round(latent_dim * ffn_ratio)))
+        self.ffn_norm = torch.nn.LayerNorm(latent_dim)
+        self.ffn = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, inner),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(inner, latent_dim),
+        )
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, queries: Tensor, context: Tensor, valid_mask: Tensor) -> Tensor:
+        if valid_mask.ndim != 2 or tuple(valid_mask.shape) != tuple(context.shape[:2]):
+            raise ValueError(
+                "semantic-visual cross-attention mask must have shape "
+                f"{tuple(context.shape[:2])}, got {tuple(valid_mask.shape)}."
+            )
+        if not bool(valid_mask.any(dim=1).all().item()):
+            raise ValueError("semantic-visual cross-attention received an empty context row.")
+        update, _ = self.cross_attn(
+            self.query_norm(queries),
+            self.context_norm(context),
+            self.context_norm(context),
+            key_padding_mask=~valid_mask.to(dtype=torch.bool),
+            need_weights=False,
+        )
+        queries = queries + self.dropout(update)
+        return queries + self.dropout(self.ffn(self.ffn_norm(queries)))
+
+
+class _SemanticVisualAggregator(torch.nn.Module):
+    """Shared recurrent language/state -> image latent aggregator used at every VLM layer."""
+
+    def __init__(
+        self,
+        *,
+        num_tokens: int,
+        latent_dim: int,
+        context_dim: int,
+        kv_dim: int,
+        num_heads: int,
+        ffn_ratio: float,
+        dropout: float,
+    ):
+        super().__init__()
+        queries = torch.empty(int(num_tokens), int(latent_dim))
+        torch.nn.init.trunc_normal_(queries, std=0.02)
+        self.queries = torch.nn.Parameter(queries)
+        block_kwargs = {
+            "latent_dim": int(latent_dim),
+            "context_dim": int(context_dim),
+            "num_heads": int(num_heads),
+            "ffn_ratio": float(ffn_ratio),
+            "dropout": float(dropout),
+        }
+        self.semantic_block = _SemanticVisualCrossAttentionBlock(**block_kwargs)
+        self.visual_block = _SemanticVisualCrossAttentionBlock(**block_kwargs)
+        self.to_key = torch.nn.Linear(int(latent_dim), int(kv_dim), bias=False)
+        self.to_value = torch.nn.Linear(int(latent_dim), int(kv_dim), bias=False)
+
+    def initial_queries(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        queries = self.queries.to(device=device, dtype=dtype)
+        return queries.unsqueeze(0).expand(int(batch_size), -1, -1)
+
+    def forward(
+        self,
+        queries: Tensor,
+        layer_hidden: Tensor,
+        *,
+        semantic_mask: Tensor,
+        image_mask: Tensor,
+    ) -> Tensor:
+        queries = self.semantic_block(queries, layer_hidden, semantic_mask)
+        return self.visual_block(queries, layer_hidden, image_mask)
+
+    def project_kv(self, tokens: Tensor) -> tuple[Tensor, Tensor]:
+        return self.to_key(tokens), self.to_value(tokens)
+
+
+class _SemanticVisualPoseDecoder(torch.nn.Module):
+    """Attention-pool all v2 tokens and decode the normalized target-pose vector."""
+
+    def __init__(self, latent_dim: int, pose_dim: int, inner_dim: int):
+        super().__init__()
+        self.pool_score = torch.nn.Linear(int(latent_dim), 1, bias=False)
+        self.net = torch.nn.Sequential(
+            torch.nn.LayerNorm(int(latent_dim)),
+            torch.nn.Linear(int(latent_dim), int(inner_dim)),
+            torch.nn.GELU(),
+            torch.nn.Linear(int(inner_dim), int(inner_dim)),
+            torch.nn.GELU(),
+            torch.nn.Linear(int(inner_dim), int(pose_dim)),
+        )
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        weights = torch.softmax(self.pool_score(tokens).float(), dim=1).to(dtype=tokens.dtype)
+        pooled = (tokens * weights).sum(dim=1)
+        return self.net(pooled)
+
+
 def _sample_beta_timesteps(
     *,
     batch_size: int,
@@ -993,6 +1115,13 @@ class MolmoAct2Policy(PreTrainedPolicy):
             )
         return pose_dim
 
+    def _uses_semantic_visual_conditioning(self) -> bool:
+        return bool(
+            getattr(self.config, "enable_goal_pose", False)
+            and getattr(self.config, "goal_conditioning_mode", "vlm_appended")
+            == "semantic_visual_recurrent"
+        )
+
     def _build_goal_pose_modules(self, model_dtype: torch.dtype) -> None:
         hidden = self._resolve_backbone_hidden_size()
         pose_dim = self._goal_pose_dim()
@@ -1009,6 +1138,28 @@ class MolmoAct2Policy(PreTrainedPolicy):
             with torch.no_grad():
                 canonical = torch.zeros(1, pose_dim, dtype=model_dtype)
                 self.goal_queries.copy_(self.goal_se3_encoder(canonical)[0])
+        if self._uses_semantic_visual_conditioning():
+            for module in (self.goal_se3_encoder, self.goal_pose_decoder):
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
+            self.goal_queries.requires_grad_(False)
+            action_expert = self._action_expert()
+            kv_dim = int(getattr(action_expert, "llm_kv_dim"))
+            latent_dim = int(self.config.semantic_visual_hidden_dim)
+            self.semantic_visual_aggregator = _SemanticVisualAggregator(
+                num_tokens=int(self.config.num_semantic_visual_tokens),
+                latent_dim=latent_dim,
+                context_dim=hidden,
+                kv_dim=kv_dim,
+                num_heads=int(self.config.semantic_visual_num_heads),
+                ffn_ratio=float(self.config.semantic_visual_ffn_ratio),
+                dropout=float(self.config.semantic_visual_dropout),
+            ).to(dtype=model_dtype)
+            self.semantic_visual_pose_decoder = _SemanticVisualPoseDecoder(
+                latent_dim=latent_dim,
+                pose_dim=pose_dim,
+                inner_dim=inner,
+            ).to(dtype=model_dtype)
 
     def _enable_gradient_checkpointing(self) -> None:
         enable_gradient_checkpointing = getattr(self._hf_model(), "gradient_checkpointing_enable", None)
@@ -1032,7 +1183,11 @@ class MolmoAct2Policy(PreTrainedPolicy):
         # backbone; keep them trainable in Stage 1 so the vision-free prior can learn.
         trainable_params = 0
         for name, param in self.named_parameters():
-            param.requires_grad = ("action_expert" in name) or ("goal_" in name)
+            param.requires_grad = (
+                ("action_expert" in name)
+                or ("goal_" in name)
+                or ("semantic_visual_" in name)
+            )
             if param.requires_grad:
                 trainable_params += param.numel()
         if trainable_params == 0:
@@ -1088,11 +1243,14 @@ class MolmoAct2Policy(PreTrainedPolicy):
         connector_params: list[Tensor] = []
         action_expert_params: list[Tensor] = []
         goal_params: list[Tensor] = []
+        semantic_visual_params: list[Tensor] = []
         vlm_params: list[Tensor] = []
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
-            if "goal_" in name:
+            if "semantic_visual_" in name:
+                semantic_visual_params.append(param)
+            elif "goal_" in name:
                 goal_params.append(param)
             elif "action_expert" in name:
                 action_expert_params.append(param)
@@ -1132,6 +1290,14 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     "name": "goal",
                 }
             )
+        if semantic_visual_params:
+            groups.append(
+                {
+                    "params": semantic_visual_params,
+                    "lr": self.config.optimizer_semantic_visual_lr,
+                    "name": "semantic_visual",
+                }
+            )
         return groups
 
     def training_audit(self) -> dict[str, Any]:
@@ -1146,7 +1312,13 @@ class MolmoAct2Policy(PreTrainedPolicy):
             "train_action_expert_only": bool(self.config.train_action_expert_only),
             "enable_goal_pose": bool(self.config.enable_goal_pose),
             "goal_token_source": self.config.goal_token_source,
+            "goal_conditioning_mode": self.config.goal_conditioning_mode,
             "num_goal_tokens": int(self.config.num_goal_tokens) if self.config.enable_goal_pose else 0,
+            "num_semantic_visual_tokens": (
+                int(self.config.num_semantic_visual_tokens)
+                if self._uses_semantic_visual_conditioning()
+                else 0
+            ),
             "mask_image_from_action_expert": bool(self.config.mask_image_from_action_expert),
             "enable_pose_reconstruction": bool(self.config.enable_pose_reconstruction),
             "trainable_parameter_groups": group_counts,
@@ -1244,6 +1416,45 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     ids.add(int(value))
         return ids
 
+    def _semantic_visual_context_masks(
+        self,
+        *,
+        input_ids: Tensor,
+        attention_mask: Tensor | None,
+        token_type_ids: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Return valid language/state and true image-feature positions for v2 aggregation."""
+        valid = (
+            attention_mask.to(device=input_ids.device, dtype=torch.bool)
+            if attention_mask is not None
+            else input_ids != -1
+        )
+        image_feature_mask = torch.zeros_like(valid, dtype=torch.bool)
+        for token_id in self._image_token_ids():
+            image_feature_mask |= input_ids == int(token_id)
+        image_feature_mask &= valid
+
+        if token_type_ids is not None:
+            multimodal_mask = token_type_ids.to(device=input_ids.device, dtype=torch.bool)
+        else:
+            multimodal_mask = image_feature_mask
+        semantic_mask = valid & ~multimodal_mask
+
+        if not bool(semantic_mask.any(dim=1).all().item()):
+            raise ValueError("semantic_visual_recurrent found no valid language/state tokens.")
+        if not bool(image_feature_mask.any(dim=1).all().item()):
+            raise ValueError("semantic_visual_recurrent found no valid image patch tokens.")
+        return semantic_mask, image_feature_mask
+
+    @staticmethod
+    def _append_context_columns(mask: Tensor | None, num_tokens: int) -> Tensor | None:
+        if mask is None or num_tokens <= 0:
+            return mask
+        columns = torch.ones(
+            mask.shape[0], int(num_tokens), device=mask.device, dtype=torch.bool
+        )
+        return torch.cat([mask.to(dtype=torch.bool), columns], dim=1)
+
     def _encoder_attention_mask_for_action_expert(
         self,
         *,
@@ -1289,11 +1500,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
 
         # The K goal tokens are appended at the end of the sequence and are always visible.
         if mask is not None and num_goal_tokens > 0:
-            mask = mask.to(dtype=torch.bool)
-            goal_cols = torch.ones(
-                mask.shape[0], int(num_goal_tokens), device=mask.device, dtype=torch.bool
-            )
-            mask = torch.cat([mask, goal_cols], dim=1)
+            mask = self._append_context_columns(mask, num_goal_tokens)
 
         return mask
 
@@ -1653,11 +1860,16 @@ class MolmoAct2Policy(PreTrainedPolicy):
         xt_flat = xt.reshape(batch_size * num_flow_timesteps, actions.shape[1], actions.shape[2])
         timesteps_flat = timesteps.reshape(batch_size * num_flow_timesteps)
 
-        goal_embeds = self._goal_token_embeddings(
-            batch,
-            batch_size=batch_size,
-            device=device,
-            dtype=next(self.model.parameters()).dtype,
+        use_semantic_visual = self._uses_semantic_visual_conditioning()
+        goal_embeds = (
+            None
+            if use_semantic_visual
+            else self._goal_token_embeddings(
+                batch,
+                batch_size=batch_size,
+                device=device,
+                dtype=next(self.model.parameters()).dtype,
+            )
         )
         num_goal_tokens = int(goal_embeds.shape[1]) if goal_embeds is not None else 0
         hidden_states, causal_mask_mapping, position_ids, cache_position = (
@@ -1673,6 +1885,24 @@ class MolmoAct2Policy(PreTrainedPolicy):
             attention_mask=model_inputs.get("attention_mask"),
             num_goal_tokens=num_goal_tokens,
         )
+        semantic_mask = None
+        image_mask = None
+        semantic_tokens = None
+        if use_semantic_visual:
+            semantic_mask, image_mask = self._semantic_visual_context_masks(
+                input_ids=model_inputs["input_ids"],
+                attention_mask=model_inputs.get("attention_mask"),
+                token_type_ids=model_inputs.get("token_type_ids"),
+            )
+            semantic_tokens = self.semantic_visual_aggregator.initial_queries(
+                batch_size,
+                device=device,
+                dtype=hidden_states.dtype,
+            )
+            encoder_attention_mask = self._append_context_columns(
+                encoder_attention_mask,
+                int(self.config.num_semantic_visual_tokens),
+            )
         action_attention_mask = None
         if batch.get("action_horizon_is_pad") is not None:
             action_attention_mask = ~batch["action_horizon_is_pad"].to(device=device, dtype=torch.bool)
@@ -1724,8 +1954,11 @@ class MolmoAct2Policy(PreTrainedPolicy):
         )
 
         def run_layer(
-            layer_idx: int, layer_hidden: Tensor, layer_action_hidden: Tensor
-        ) -> tuple[Tensor, Tensor]:
+            layer_idx: int,
+            layer_hidden: Tensor,
+            layer_action_hidden: Tensor,
+            layer_semantic_tokens: Tensor,
+        ) -> tuple[Tensor, Tensor, Tensor]:
             decoder_block = transformer.blocks[layer_idx]
             action_block = action_expert.blocks[layer_idx]
             if transformer.config.rope_scaling_layers is not None:
@@ -1756,6 +1989,27 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 key_states = key_states.detach()
                 value_states = value_states.detach()
 
+            next_semantic_tokens = layer_semantic_tokens
+            if use_semantic_visual:
+                aggregator_hidden = next_hidden
+                if layer_idx == int(transformer.config.num_hidden_layers) - 1:
+                    # HF output_hidden_states exposes the final layer after ln_f; mirror
+                    # that convention so training and inference recurse over the same states.
+                    aggregator_hidden = transformer.ln_f(aggregator_hidden)
+                if self.config.enable_knowledge_insulation:
+                    aggregator_hidden = aggregator_hidden.detach()
+                next_semantic_tokens = self.semantic_visual_aggregator(
+                    layer_semantic_tokens,
+                    aggregator_hidden,
+                    semantic_mask=semantic_mask,
+                    image_mask=image_mask,
+                )
+                semantic_k, semantic_v = self.semantic_visual_aggregator.project_kv(
+                    next_semantic_tokens
+                )
+                key_states = torch.cat([key_states, semantic_k], dim=1)
+                value_states = torch.cat([value_states, semantic_v], dim=1)
+
             k_ctx = action_expert._project_kv_tensor(key_states, action_expert.context_k_proj)
             v_ctx = action_expert._project_kv_tensor(value_states, action_expert.context_v_proj)
             k_norm = action_block.cross_attn.k_norm
@@ -1777,22 +2031,33 @@ class MolmoAct2Policy(PreTrainedPolicy):
             )
             if valid_action is not None:
                 next_action_hidden = next_action_hidden * valid_action
-            return next_hidden, next_action_hidden
+            return next_hidden, next_action_hidden, next_semantic_tokens
 
+        if semantic_tokens is None:
+            semantic_tokens = hidden_states.new_empty(
+                batch_size, 0, int(self.config.semantic_visual_hidden_dim)
+            )
         for layer_idx in range(int(transformer.config.num_hidden_layers)):
             if use_gradient_checkpointing:
-                hidden_states, action_hidden = torch.utils.checkpoint.checkpoint(
-                    lambda layer_hidden, layer_action_hidden, idx=layer_idx: run_layer(
+                hidden_states, action_hidden, semantic_tokens = torch.utils.checkpoint.checkpoint(
+                    lambda layer_hidden, layer_action_hidden, layer_semantic_tokens, idx=layer_idx: run_layer(
                         idx,
                         layer_hidden,
                         layer_action_hidden,
+                        layer_semantic_tokens,
                     ),
                     hidden_states,
                     action_hidden,
+                    semantic_tokens,
                     use_reentrant=False,
                 )
             else:
-                hidden_states, action_hidden = run_layer(layer_idx, hidden_states, action_hidden)
+                hidden_states, action_hidden, semantic_tokens = run_layer(
+                    layer_idx,
+                    hidden_states,
+                    action_hidden,
+                    semantic_tokens,
+                )
 
         hidden_states = transformer.ln_f(hidden_states)
         pred_velocity = action_expert.final_layer(action_hidden, conditioning)
@@ -1809,7 +2074,8 @@ class MolmoAct2Policy(PreTrainedPolicy):
         loss = loss.reshape(batch_size, -1).mean(dim=1)
         if reduction == "mean":
             loss = loss.mean()
-        return loss, hidden_states
+        pose_conditioning = semantic_tokens if use_semantic_visual else hidden_states
+        return loss, pose_conditioning
 
     def _discrete_token_weights(self, valid_positions: Tensor) -> Tensor | None:
         mode = self.config.discrete_loss_token_weighting
@@ -2165,6 +2431,16 @@ class MolmoAct2Policy(PreTrainedPolicy):
             depth_mask,
             depth_gate,
         )
+        if self._uses_semantic_visual_conditioning():
+            encoder_kv_states, _semantic_tokens = self._semantic_visual_inference_context(
+                outputs=outputs,
+                encoder_kv_states=encoder_kv_states,
+                model_inputs=model_inputs,
+            )
+            encoder_attention_mask = self._append_context_columns(
+                encoder_attention_mask,
+                int(self.config.num_semantic_visual_tokens),
+            )
 
         steps = int(num_steps or backbone.config.flow_matching_num_steps)
         if steps <= 0:
@@ -2253,6 +2529,14 @@ class MolmoAct2Policy(PreTrainedPolicy):
         embedding level (input_ids and inputs_embeds are mutually exclusive on the backbone).
         """
         backbone = self._backbone()
+        if self._uses_semantic_visual_conditioning():
+            outputs = backbone(
+                **model_inputs,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=True,
+            )
+            return outputs, 0
         if not getattr(self.config, "enable_goal_pose", False):
             outputs = backbone(
                 **model_inputs,
@@ -2308,6 +2592,56 @@ class MolmoAct2Policy(PreTrainedPolicy):
         )
         return outputs, num_goal
 
+    def _semantic_visual_inference_context(
+        self,
+        *,
+        outputs: Any,
+        encoder_kv_states: Any,
+        model_inputs: dict[str, Tensor],
+    ) -> tuple[list[tuple[Tensor, Tensor]], Tensor]:
+        """Rebuild the recurrent v2 latent path from prefill per-layer hidden states."""
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None:
+            raise RuntimeError(
+                "semantic_visual_recurrent inference requires output_hidden_states=True."
+            )
+        num_layers = len(encoder_kv_states)
+        if len(hidden_states) != num_layers + 1:
+            raise RuntimeError(
+                "semantic_visual_recurrent expected one hidden state per VLM layer plus "
+                f"the embedding state, got {len(hidden_states)} for {num_layers} layers."
+            )
+        semantic_mask, image_mask = self._semantic_visual_context_masks(
+            input_ids=model_inputs["input_ids"],
+            attention_mask=model_inputs.get("attention_mask"),
+            token_type_ids=model_inputs.get("token_type_ids"),
+        )
+        source = hidden_states[0]
+        semantic_tokens = self.semantic_visual_aggregator.initial_queries(
+            int(source.shape[0]),
+            device=source.device,
+            dtype=source.dtype,
+        )
+        augmented: list[tuple[Tensor, Tensor]] = []
+        for layer_idx, (key_states, value_states) in enumerate(encoder_kv_states):
+            layer_hidden = hidden_states[layer_idx + 1]
+            semantic_tokens = self.semantic_visual_aggregator(
+                semantic_tokens,
+                layer_hidden,
+                semantic_mask=semantic_mask,
+                image_mask=image_mask,
+            )
+            semantic_k, semantic_v = self.semantic_visual_aggregator.project_kv(
+                semantic_tokens
+            )
+            augmented.append(
+                (
+                    torch.cat([key_states, semantic_k], dim=1),
+                    torch.cat([value_states, semantic_v], dim=1),
+                )
+            )
+        return augmented, semantic_tokens
+
     def _compute_pose_reconstruction_loss(
         self, batch: dict[str, Tensor], hidden_states: Tensor
     ) -> Tensor | None:
@@ -2322,9 +2656,18 @@ class MolmoAct2Policy(PreTrainedPolicy):
         goal_pose = batch.get("goal_pose")
         if goal_pose is None:
             return None
-        num_tokens = int(self.config.num_goal_tokens)
-        goal_hidden = hidden_states[:, -num_tokens:, :]
-        pred = self.goal_pose_decoder(goal_hidden).float()
+        if self._uses_semantic_visual_conditioning():
+            expected_tokens = int(self.config.num_semantic_visual_tokens)
+            if hidden_states.shape[1] != expected_tokens:
+                raise ValueError(
+                    "semantic-visual pose decoder expected "
+                    f"{expected_tokens} tokens, got {hidden_states.shape[1]}."
+                )
+            pred = self.semantic_visual_pose_decoder(hidden_states).float()
+        else:
+            num_tokens = int(self.config.num_goal_tokens)
+            goal_hidden = hidden_states[:, -num_tokens:, :]
+            pred = self.goal_pose_decoder(goal_hidden).float()
         target = goal_pose.to(device=pred.device, dtype=pred.dtype)
         per_sample = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
         is_pad = batch.get("goal_pose_is_pad")

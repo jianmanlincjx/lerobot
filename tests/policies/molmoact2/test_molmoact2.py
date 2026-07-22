@@ -184,6 +184,40 @@ def test_goal_pose_config_validation_and_scheduler_group():
     assert cfg.target_pose_delta_index == 10
 
 
+def test_semantic_visual_config_validation_and_scheduler_group():
+    cfg = MolmoAct2Config(
+        checkpoint_path="/tmp/x",
+        action_mode="continuous",
+        enable_goal_pose=True,
+        goal_token_source="learnable_queries",
+        goal_conditioning_mode="semantic_visual_recurrent",
+        target_pose_delta_index=10,
+        enable_pose_reconstruction=True,
+        mask_image_from_action_expert=True,
+        num_semantic_visual_tokens=100,
+        semantic_visual_hidden_dim=768,
+        semantic_visual_num_heads=8,
+        scheduler_semantic_visual_warmup_steps=1000,
+    )
+    assert cfg.inferred_max_sequence_length() == MolmoAct2Config(
+        checkpoint_path="/tmp/x",
+        action_mode="continuous",
+    ).inferred_max_sequence_length()
+    assert cfg.get_scheduler_preset().semantic_visual_warmup_steps == 1000
+
+    with pytest.raises(ValueError):
+        MolmoAct2Config(
+            checkpoint_path="/tmp/x",
+            action_mode="continuous",
+            enable_goal_pose=True,
+            goal_token_source="learnable_queries",
+            goal_conditioning_mode="semantic_visual_recurrent",
+            target_pose_delta_index=10,
+            enable_pose_reconstruction=True,
+            mask_image_from_action_expert=False,
+        )
+
+
 def test_infer_max_sequence_length_accounts_for_goal_tokens():
     base = infer_molmoact2_max_sequence_length(
         num_images=2, state_dim=8, action_dim=7, action_horizon=10, include_discrete_action=False
@@ -206,6 +240,33 @@ def test_goal_se3_encoder_and_decoder_shapes():
     tokens = encoder(torch.randn(3, 8))
     assert tokens.shape == (3, 4, 16)
     assert decoder(tokens).shape == (3, 8)
+
+
+def test_semantic_visual_aggregator_recurrent_shapes_and_pose_decoder():
+    aggregator = molmoact2_modeling._SemanticVisualAggregator(
+        num_tokens=100,
+        latent_dim=32,
+        context_dim=48,
+        kv_dim=24,
+        num_heads=4,
+        ffn_ratio=2.0,
+        dropout=0.0,
+    )
+    layer_hidden = torch.randn(2, 12, 48)
+    semantic_mask = torch.tensor(
+        [[True] * 5 + [False] * 7, [True] * 5 + [False] * 7]
+    )
+    image_mask = ~semantic_mask
+    q0 = aggregator.initial_queries(2, device=torch.device("cpu"), dtype=torch.float32)
+    q1 = aggregator(q0, layer_hidden, semantic_mask=semantic_mask, image_mask=image_mask)
+    q2 = aggregator(q1, layer_hidden, semantic_mask=semantic_mask, image_mask=image_mask)
+    key, value = aggregator.project_kv(q2)
+
+    assert q0.shape == q1.shape == q2.shape == (2, 100, 32)
+    assert not torch.equal(q1, q2)
+    assert key.shape == value.shape == (2, 100, 24)
+    decoder = molmoact2_modeling._SemanticVisualPoseDecoder(32, 8, 16)
+    assert decoder(q2).shape == (2, 8)
 
 
 def test_goal_token_embeddings_from_queries_and_encoder():
@@ -247,6 +308,28 @@ def test_encoder_attention_mask_masks_image_and_appends_goal_tokens():
     assert mask[0].tolist() == [True, False, False, True, True, True]
 
 
+def test_semantic_visual_masks_split_semantic_and_image_feature_tokens():
+    policy = object.__new__(MolmoAct2Policy)
+    policy.model = SimpleNamespace(
+        config=SimpleNamespace(image_patch_id=999, image_low_res_id=998)
+    )
+    policy._backbone = lambda: SimpleNamespace(config=SimpleNamespace())
+    input_ids = torch.tensor([[10, 999, 999, 11, 998, 12]])
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+    token_type_ids = torch.tensor([[False, True, True, False, True, False]])
+
+    semantic, image = policy._semantic_visual_context_masks(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        token_type_ids=token_type_ids,
+    )
+    assert semantic[0].tolist() == [True, False, False, True, False, True]
+    assert image[0].tolist() == [False, True, True, False, True, False]
+    augmented = policy._append_context_columns(semantic, 100)
+    assert augmented.shape == (1, 106)
+    assert bool(augmented[:, -100:].all())
+
+
 def test_pose_reconstruction_loss_honors_pad_mask():
     policy = object.__new__(MolmoAct2Policy)
     torch.nn.Module.__init__(policy)
@@ -266,6 +349,25 @@ def test_pose_reconstruction_loss_honors_pad_mask():
         enable_goal_pose=True, enable_pose_reconstruction=False, num_goal_tokens=4
     )
     assert policy._compute_pose_reconstruction_loss(batch, hidden) is None
+
+
+def test_semantic_visual_pose_reconstruction_uses_all_tokens_and_pad_mask():
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(
+        enable_goal_pose=True,
+        enable_pose_reconstruction=True,
+        goal_conditioning_mode="semantic_visual_recurrent",
+        num_semantic_visual_tokens=100,
+    )
+    policy.semantic_visual_pose_decoder = molmoact2_modeling._SemanticVisualPoseDecoder(32, 8, 16)
+    tokens = torch.randn(2, 100, 32)
+    batch = {
+        "goal_pose": torch.randn(2, 8),
+        "goal_pose_is_pad": torch.tensor([False, True]),
+    }
+    loss = policy._compute_pose_reconstruction_loss(batch, tokens)
+    assert loss is not None and loss.ndim == 0 and torch.isfinite(loss)
 
 
 def test_extract_state_and_goal_pose_from_multi_frame_state():
