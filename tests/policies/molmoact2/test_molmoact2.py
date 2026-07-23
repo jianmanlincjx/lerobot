@@ -862,6 +862,110 @@ def test_inference_action_mode_is_explicit_and_has_no_action_mode_alias():
         policy.predict_action_chunk({}, action_mode="continuous")
 
 
+def test_non_rtc_learned_goal_inference_uses_policy_context_generation():
+    class DummyBackbone:
+        def generate_actions_from_inputs(self, **kwargs):
+            del kwargs
+            raise AssertionError("learned goal inference must not use upstream generation")
+
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+    policy.anchor = torch.nn.Parameter(torch.tensor(1.0))
+    policy.config = SimpleNamespace(
+        enable_goal_pose=True,
+        goal_token_source="learnable_queries",
+        rtc_config=None,
+        model_dtype="float32",
+        n_action_steps=1,
+    )
+    policy._model_inputs = lambda batch: {"input_ids": torch.ones(1, 3, dtype=torch.long)}
+    policy._resolve_inference_action_mode = lambda requested: "continuous"
+    policy._output_action_dim = lambda batch: 3
+    policy._backbone = lambda: DummyBackbone()
+
+    calls: list[str] = []
+
+    def policy_context_generation(**kwargs):
+        del kwargs
+        calls.append("policy_context")
+        return torch.ones(1, 2, 3)
+
+    policy._generate_actions_from_inputs_with_rtc = policy_context_generation
+    actions = policy.predict_action_chunk({}, generator=torch.Generator().manual_seed(0))
+
+    assert calls == ["policy_context"]
+    assert actions.shape == (1, 1, 3)
+
+
+def test_policy_context_generation_routing_preserves_baseline_and_stage1():
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+
+    policy.config = SimpleNamespace(
+        enable_goal_pose=False,
+        goal_token_source="learnable_queries",
+        rtc_config=None,
+    )
+    assert not policy._uses_policy_continuous_generation()
+
+    policy.config = SimpleNamespace(
+        enable_goal_pose=True,
+        goal_token_source="se3_encoder",
+        rtc_config=None,
+    )
+    assert not policy._uses_policy_continuous_generation()
+
+    policy.config = SimpleNamespace(
+        enable_goal_pose=True,
+        goal_token_source="learnable_queries",
+        rtc_config=None,
+    )
+    assert policy._uses_policy_continuous_generation()
+
+
+def test_v1_prefill_appends_goal_token_masks_and_token_types():
+    class DummyBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.tensor(1.0))
+            self.received = None
+
+        def merge_visual_inputs(self, **kwargs):
+            del kwargs
+            return None, None
+
+        def build_input_embeddings(self, input_ids, images, token_pooling):
+            del images, token_pooling
+            return torch.zeros(input_ids.shape[0], input_ids.shape[1], 8), None
+
+        def forward(self, **kwargs):
+            self.received = kwargs
+            return SimpleNamespace(past_key_values=object())
+
+    backbone = DummyBackbone()
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+    policy.model = backbone
+    policy.config = SimpleNamespace(enable_goal_pose=True)
+    policy._backbone = lambda: backbone
+    policy._goal_token_embeddings = lambda *args, **kwargs: torch.ones(2, 4, 8)
+
+    outputs, num_goal = policy._backbone_prefill_outputs(
+        {
+            "input_ids": torch.ones(2, 6, dtype=torch.long),
+            "attention_mask": torch.ones(2, 6, dtype=torch.long),
+            "token_type_ids": torch.tensor([[False, True, True, False, False, False]] * 2),
+        }
+    )
+
+    assert outputs.past_key_values is not None
+    assert num_goal == 4
+    assert backbone.received["inputs_embeds"].shape == (2, 10, 8)
+    assert backbone.received["attention_mask"].shape == (2, 10)
+    assert backbone.received["token_type_ids"].shape == (2, 10)
+    assert not bool(backbone.received["token_type_ids"][:, -4:].any())
+
+
 def test_rtc_generation_uses_previous_chunk_prefix():
     class DummyActionExpert(torch.nn.Module):
         def __init__(self):

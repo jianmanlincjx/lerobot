@@ -961,6 +961,14 @@ class MolmoAct2Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    def _uses_policy_continuous_generation(self) -> bool:
+        """Whether continuous inference needs the policy-owned goal-context path."""
+        uses_learned_goal_context = bool(
+            getattr(self.config, "enable_goal_pose", False)
+            and getattr(self.config, "goal_token_source", None) == "learnable_queries"
+        )
+        return self._rtc_enabled() or uses_learned_goal_context
+
     def _action_expert(self) -> torch.nn.Module:
         return self._backbone()._require_action_expert()
 
@@ -2146,6 +2154,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
         prev_chunk_left_over: Tensor | None,
         execution_horizon: int | None,
     ) -> Tensor:
+        """Generate continuous actions with policy-owned context, optionally applying RTC."""
         backbone = self._backbone()
         action_expert = self._action_expert()
         outputs, num_goal_tokens = self._backbone_prefill_outputs(model_inputs)
@@ -2287,6 +2296,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
         inputs_embeds, _image_features = backbone.build_input_embeddings(input_ids, images, token_pooling)
 
         attention_mask = model_inputs.get("attention_mask")
+        token_type_ids = model_inputs.get("token_type_ids")
         num_goal = 0
         if goal_embeds is not None:
             goal_embeds = goal_embeds.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
@@ -2297,11 +2307,19 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     attention_mask.shape[0], num_goal, device=attention_mask.device, dtype=attention_mask.dtype
                 )
                 attention_mask = torch.cat([attention_mask, pad], dim=1)
+            if token_type_ids is not None:
+                pad = torch.zeros(
+                    token_type_ids.shape[0],
+                    num_goal,
+                    device=token_type_ids.device,
+                    dtype=token_type_ids.dtype,
+                )
+                token_type_ids = torch.cat([token_type_ids, pad], dim=1)
 
         outputs = backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            token_type_ids=model_inputs.get("token_type_ids"),
+            token_type_ids=token_type_ids,
             use_cache=True,
             output_attentions=False,
             output_hidden_states=False,
@@ -2433,7 +2451,14 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     model_inputs=model_inputs,
                     action_dim=action_dim,
                 )
-            elif self._rtc_enabled():
+            elif self._uses_policy_continuous_generation():
+                if not getattr(self, "_logged_policy_continuous_generation", False):
+                    logging.info(
+                        "MolmoAct2 continuous inference using policy context path "
+                        "(goal_mode=vlm_appended, semantic_visual=False, rtc=%s).",
+                        self._rtc_enabled(),
+                    )
+                    self._logged_policy_continuous_generation = True
                 actions = self._generate_actions_from_inputs_with_rtc(
                     model_inputs=model_inputs,
                     action_dim_is_pad=batch.get("action_dim_is_pad"),
