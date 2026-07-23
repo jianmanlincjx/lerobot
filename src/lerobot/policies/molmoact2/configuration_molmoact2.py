@@ -186,10 +186,18 @@ class MolmoAct2Config(PreTrainedConfig):
     # are appended to the AE context (not to the causal VLM sequence).
     goal_conditioning_mode: str = "vlm_appended"
     num_semantic_visual_tokens: int = 100
+    # v2 scheme-2a: the first `num_semantic_visual_pose_tokens` latent tokens form the
+    # goal-pose group (supervised by L_pose via a concat readout); the remaining tokens
+    # are the context group. All tokens still condition the action expert.
+    num_semantic_visual_pose_tokens: int = 8
     semantic_visual_hidden_dim: int = 768
     semantic_visual_num_heads: int = 8
     semantic_visual_ffn_ratio: float = 4.0
     semantic_visual_dropout: float = 0.0
+    # Backward-compatible defaults reproduce v2 exactly. v2b enables global latent
+    # self-attention and splits the VLM depth into multiple parameter groups.
+    semantic_visual_enable_self_attention: bool = False
+    semantic_visual_num_layer_groups: int = 1
     optimizer_semantic_visual_lr: float = 1e-5
     scheduler_semantic_visual_warmup_steps: int | None = None
     normalize_language: bool = True
@@ -385,6 +393,11 @@ class MolmoAct2Config(PreTrainedConfig):
             raise ValueError(
                 f"semantic_visual_dropout must be in [0, 1], got {self.semantic_visual_dropout}."
             )
+        if self.semantic_visual_num_layer_groups < 1:
+            raise ValueError(
+                "semantic_visual_num_layer_groups must be >= 1, "
+                f"got {self.semantic_visual_num_layer_groups}."
+            )
         if self.enable_goal_pose:
             if self.num_goal_tokens < 1:
                 raise ValueError(f"num_goal_tokens must be >= 1, got {self.num_goal_tokens}.")
@@ -417,6 +430,12 @@ class MolmoAct2Config(PreTrainedConfig):
                     raise ValueError(
                         "semantic_visual_recurrent requires mask_image_from_action_expert=true; "
                         "raw image KV must reach the AE only through the latent aggregator."
+                    )
+                if not 1 <= self.num_semantic_visual_pose_tokens < self.num_semantic_visual_tokens:
+                    raise ValueError(
+                        "num_semantic_visual_pose_tokens must satisfy "
+                        "1 <= num_semantic_visual_pose_tokens < num_semantic_visual_tokens, got "
+                        f"{self.num_semantic_visual_pose_tokens} vs {self.num_semantic_visual_tokens}."
                     )
         elif (
             self.mask_image_from_action_expert
