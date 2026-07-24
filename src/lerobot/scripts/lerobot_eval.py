@@ -105,6 +105,8 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    progress_episode_count: int | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -231,11 +233,28 @@ def rollout(
         all_successes.append(torch.tensor(successes))
 
         step += 1
-        running_success_rate = (
-            einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
-        )
+        running_successes = einops.reduce(
+            torch.stack(all_successes, dim=1), "b n -> b", "any"
+        ).numpy()
+        running_success_rate = running_successes.mean()
         progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
         progbar.update()
+        if progress_callback is not None:
+            episode_count = min(
+                int(progress_episode_count or env.num_envs),
+                int(env.num_envs),
+            )
+            success_count = int(running_successes[:episode_count].sum())
+            progress_callback(
+                {
+                    "step": step,
+                    "max_steps": int(max_steps),
+                    "finished_rollouts": int(done[:episode_count].sum()),
+                    "successes_so_far": success_count,
+                    "total_rollouts": episode_count,
+                    "running_success_rate": 100.0 * success_count / episode_count,
+                }
+            )
 
     # Track the final observation.
     if return_observations:
@@ -273,6 +292,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     """
     Args:
@@ -351,6 +371,27 @@ def eval_policy(
             seeds = range(
                 start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs)
             )
+        completed_before_batch = min(batch_ix * env.num_envs, n_episodes)
+        episodes_in_batch = min(env.num_envs, n_episodes - completed_before_batch)
+        successes_before_batch = sum(bool(value) for value in all_successes[:completed_before_batch])
+
+        def report_batch_progress(payload: dict[str, Any]) -> None:
+            if progress_callback is None:
+                return
+            successes_so_far = successes_before_batch + int(payload["successes_so_far"])
+            finished_rollouts = completed_before_batch + int(payload["finished_rollouts"])
+            progress_callback(
+                {
+                    **payload,
+                    "batch_index": batch_ix,
+                    "successes_so_far": successes_so_far,
+                    "finished_rollouts": min(finished_rollouts, n_episodes),
+                    "total_rollouts": n_episodes,
+                    # This is a monotonic lower bound while unfinished episodes can still succeed.
+                    "running_success_rate": 100.0 * successes_so_far / n_episodes,
+                }
+            )
+
         rollout_data = rollout(
             env=env,
             policy=policy,
@@ -361,6 +402,8 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            progress_callback=report_batch_progress if progress_callback is not None else None,
+            progress_episode_count=episodes_in_batch,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -619,6 +662,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -636,6 +680,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        progress_callback=progress_callback,
     )
 
     per_episode = task_result["per_episode"]
@@ -662,6 +707,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    progress_callback: Callable[[str, int, dict[str, Any]], None] | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -674,6 +720,10 @@ def run_one(
         task_videos_dir.mkdir(parents=True, exist_ok=True)
 
     # Call the existing eval_one (assumed to return TaskMetrics-like dict)
+    task_progress_callback = None
+    if progress_callback is not None:
+        task_progress_callback = lambda payload: progress_callback(task_group, task_id, payload)
+
     metrics = eval_one(
         env,
         policy=policy,
@@ -686,6 +736,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        progress_callback=task_progress_callback,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -725,6 +776,9 @@ def eval_policy_all(
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
     overall: dict[str, list] = {k: [] for k in ACC_KEYS}
     per_task_infos: list[dict] = []
+    running_tasks: dict[str, dict[str, Any]] = {}
+    live_lock = threading.Lock()
+    last_live_write = 0.0
 
     def _aggregate(acc: dict[str, list]) -> dict:
         successes = acc["successes"]
@@ -738,13 +792,14 @@ def eval_policy_all(
             "eval_s": elapsed,
         }
 
-    def _write_live(status: str) -> None:
+    def _write_live_unlocked(status: str) -> None:
         if live_output_path is None:
             return
         payload = {
             "status": status,
             "completed_tasks": len(per_task_infos),
             "total_tasks": len(tasks),
+            "running_tasks": list(running_tasks.values()),
             "per_task": per_task_infos,
             "per_group": {group: _aggregate(acc) for group, acc in group_acc.items()},
             "overall": _aggregate(overall),
@@ -754,6 +809,52 @@ def eval_policy_all(
         tmp_path = live_output_path.with_suffix(f"{live_output_path.suffix}.tmp")
         tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         tmp_path.replace(live_output_path)
+
+        realtime_path = live_output_path.parent / "realtime_accuracy.json"
+        realtime_payload = {
+            "status": status,
+            "completed_tasks": len(per_task_infos),
+            "total_tasks": len(tasks),
+            "completed_rollouts": _aggregate(overall),
+            "running_tasks": list(running_tasks.values()),
+            "note": (
+                "running_success_rate is a lower bound over all configured rollouts; "
+                "unfinished rollouts may still succeed."
+            ),
+            "updated_at": time.time(),
+        }
+        realtime_tmp = realtime_path.with_suffix(f"{realtime_path.suffix}.tmp")
+        realtime_tmp.write_text(json.dumps(realtime_payload, indent=2) + "\n", encoding="utf-8")
+        realtime_tmp.replace(realtime_path)
+
+    def _write_live(status: str) -> None:
+        with live_lock:
+            _write_live_unlocked(status)
+
+    def _update_running_task(task_group: str, task_id: int, progress: dict[str, Any]) -> None:
+        nonlocal last_live_write
+        now = time.time()
+        key = f"{task_group}:{task_id}"
+        with live_lock:
+            previous = running_tasks.get(key, {})
+            running_tasks[key] = {
+                "task_group": task_group,
+                "task_id": task_id,
+                **progress,
+                "accuracy_is_lower_bound": True,
+                "updated_at": now,
+            }
+            changed = (
+                previous.get("successes_so_far") != progress.get("successes_so_far")
+                or previous.get("finished_rollouts") != progress.get("finished_rollouts")
+            )
+            if changed or now - last_live_write >= 2.0:
+                _write_live_unlocked("running")
+                last_live_write = now
+
+    def _finish_running_task(task_group: str, task_id: int) -> None:
+        with live_lock:
+            running_tasks.pop(f"{task_group}:{task_id}", None)
 
     _write_live("running")
 
@@ -794,6 +895,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        progress_callback=_update_running_task,
     )
 
     if max_parallel_tasks <= 1:
@@ -805,6 +907,7 @@ def eval_policy_all(
 
             try:
                 tg, tid, metrics = task_runner(task_group, task_id, env)
+                _finish_running_task(tg, tid)
                 _accumulate_to(tg, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                 _write_live("running")
@@ -827,6 +930,7 @@ def eval_policy_all(
                 tg, tid, env = fut2meta[fut]
                 try:
                     tg, tid, metrics = fut.result()
+                    _finish_running_task(tg, tid)
                     _accumulate_to(tg, metrics)
                     per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                     _write_live("running")
