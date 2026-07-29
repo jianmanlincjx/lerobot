@@ -47,14 +47,25 @@ def _get_suite(name: str) -> benchmark.Benchmark:
 
 
 def _select_task_ids(total_tasks: int, task_ids: Iterable[int] | None) -> list[int]:
-    """Validate/normalize task ids. If None → all tasks."""
+    """Validate/normalize task ids. If None → all tasks.
+
+    When ``task_ids`` is provided, **preserve caller order** (dedupe first-seen).
+    Sorting would undo intentional schedules such as LIBERO-plus shuffled
+    perturbation order.
+    """
     if task_ids is None:
         return list(range(total_tasks))
-    ids = sorted({int(t) for t in task_ids})
-    for t in ids:
-        if t < 0 or t >= total_tasks:
-            raise ValueError(f"task_id {t} out of range [0, {total_tasks - 1}].")
-    return ids
+    selected: list[int] = []
+    seen: set[int] = set()
+    for raw in task_ids:
+        tid = int(raw)
+        if tid in seen:
+            continue
+        if tid < 0 or tid >= total_tasks:
+            raise ValueError(f"task_id {tid} out of range [0, {total_tasks - 1}].")
+        seen.add(tid)
+        selected.append(tid)
+    return selected
 
 
 # LIBERO-plus perturbation variants encode the perturbation in the filename
