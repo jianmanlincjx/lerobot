@@ -52,6 +52,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 import concurrent.futures as cf
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -93,6 +94,68 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _maybe_overlay_goal_pose_frames(
+    policy: PreTrainedPolicy,
+    env: gym.vector.VectorEnv,
+    frames: np.ndarray,
+) -> np.ndarray:
+    """Overlay decoded MolmoAct2 goal poses onto rendered frames when possible.
+
+    Requires SyncVectorEnv (direct sim access) and a policy that caches
+    ``_last_goal_pose_norm`` via ``get_last_goal_pose_norm()``. Controlled by
+    the ``POSE_VIZ_DIR`` environment variable in ``eval_policy``.
+    """
+    pose = policy.get_last_goal_pose_norm() if hasattr(policy, "get_last_goal_pose_norm") else None
+    if pose is None:
+        return frames
+    if not isinstance(env, gym.vector.SyncVectorEnv):
+        raise RuntimeError("POSE_VIZ overlay currently requires SyncVectorEnv")
+
+    from robosuite.utils.camera_utils import (
+        get_camera_transform_matrix,
+        project_points_from_world_to_camera,
+    )
+
+    pose_np = pose.detach().float().cpu().numpy()
+    stats = getattr(getattr(policy, "config", None), "dataset_stats", None)
+    if isinstance(stats, dict) and "observation.state" in stats:
+        q01 = np.asarray(stats["observation.state"].get("q01"), dtype=np.float64)
+        q99 = np.asarray(stats["observation.state"].get("q99"), dtype=np.float64)
+        if q01 is not None and q99 is not None and np.asarray(q01).shape[-1] >= 3:
+            q01 = np.asarray(q01, dtype=np.float64)
+            q99 = np.asarray(q99, dtype=np.float64)
+            denom = np.maximum(q99[:3] - q01[:3], 1e-6)
+            xyz = (pose_np[..., :3] + 1.0) * denom / 2.0 + q01[:3]
+        else:
+            xyz = pose_np[..., :3]
+    else:
+        xyz = pose_np[..., :3]
+
+    out = frames.copy()
+    n = min(out.shape[0], int(xyz.shape[0]), len(env.envs))
+    for i in range(n):
+        sub = env.envs[i]
+        inner = getattr(sub, "_env", None)
+        if inner is None:
+            continue
+        sim = getattr(getattr(inner, "env", None), "sim", None) or getattr(inner, "sim", None)
+        if sim is None:
+            continue
+        h, w = out[i].shape[:2]
+        transform = get_camera_transform_matrix(sim, "agentview", h, w)
+        pixels = project_points_from_world_to_camera(
+            np.asarray(xyz[i], dtype=np.float64).reshape(1, 3), transform, h, w
+        )[0]
+        row, col = int(pixels[0]), int(pixels[1])
+        row = h - 1 - row
+        col = w - 1 - col
+        if 0 <= row < h and 0 <= col < w:
+            rr = slice(max(0, row - 3), min(h, row + 4))
+            cc = slice(max(0, col - 3), min(w, col + 4))
+            out[i, rr, cc] = np.array([255, 40, 40], dtype=out.dtype)
+    return out
 
 
 def rollout(
@@ -345,11 +408,24 @@ def eval_policy(
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
         if isinstance(env, gym.vector.SyncVectorEnv):
-            ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
+            frames_now = np.stack([env.envs[i].render() for i in range(n_to_render_now)])  # noqa: B023
         elif hasattr(env, "call"):
             # Here we must render all frames and discard any we don't need.
             # Covers AsyncVectorEnv and _LazyAsyncVectorEnv (which wraps one).
-            ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
+            frames_now = np.stack(env.call("render")[:n_to_render_now])
+        else:
+            return
+
+        # Optional goal-pose overlay for MolmoAct2 when POSE_VIZ_DIR is set.
+        pose_viz_dir = os.environ.get("POSE_VIZ_DIR", "").strip()
+        if pose_viz_dir and hasattr(policy, "get_last_goal_pose_norm"):
+            try:
+                frames_now = _maybe_overlay_goal_pose_frames(policy, env, frames_now)
+            except Exception as exc:  # noqa: BLE001
+                if not getattr(render_frame, "_pose_viz_warned", False):
+                    logging.warning("POSE_VIZ overlay skipped: %s", exc)
+                    render_frame._pose_viz_warned = True  # type: ignore[attr-defined]
+        ep_frames.append(frames_now)
 
     if max_episodes_rendered > 0:
         video_paths: list[str] = []

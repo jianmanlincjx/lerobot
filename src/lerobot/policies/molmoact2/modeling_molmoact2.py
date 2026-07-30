@@ -2852,7 +2852,23 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     torch.cat([value_states, semantic_v], dim=1),
                 )
             )
+        # Cache decoded goal pose (normalized) for optional visualization overlays.
+        if (
+            bool(getattr(self.config, "enable_pose_reconstruction", False))
+            and hasattr(self, "semantic_visual_pose_decoder")
+            and hasattr(self, "semantic_visual_pose_norm")
+        ):
+            num_pose_tokens = int(self.config.num_semantic_visual_pose_tokens)
+            pose_hidden = self.semantic_visual_pose_norm(
+                semantic_tokens[:, :num_pose_tokens, :]
+            )
+            self._last_goal_pose_norm = self.semantic_visual_pose_decoder(pose_hidden).detach()
         return augmented, semantic_tokens
+
+    def get_last_goal_pose_norm(self) -> Tensor | None:
+        """Return the most recent decoded goal-pose vector, if available."""
+        pose = getattr(self, "_last_goal_pose_norm", None)
+        return pose if isinstance(pose, Tensor) else None
 
     def _compute_pose_reconstruction_loss(
         self, batch: dict[str, Tensor], hidden_states: Tensor
