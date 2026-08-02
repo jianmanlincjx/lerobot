@@ -17,9 +17,12 @@
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import datasets
+import numpy as np
+import pyarrow.parquet as pq
 import torch
 
 from .dataset_metadata import LeRobotDatasetMetadata
@@ -33,6 +36,16 @@ from .io_utils import (
     load_nested_dataset,
 )
 from .video_utils import decode_video_frames
+
+
+@dataclass(frozen=True)
+class SampleManifest:
+    indices: np.ndarray
+    episode_indices: np.ndarray
+    frame_indices: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.indices)
 
 
 class DatasetReader:
@@ -51,6 +64,7 @@ class DatasetReader:
         delta_timestamps: dict[str, list[float]] | None,
         image_transforms: Callable | None,
         return_uint8: bool = False,
+        sample_indices_path: str | Path | None = None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -76,9 +90,12 @@ class DatasetReader:
         self._video_backend = video_backend
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
+        self.sample_indices_path = Path(sample_indices_path).expanduser() if sample_indices_path else None
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
+        self._sample_manifest_rows = self._load_sample_manifest()
+        self._sample_relative_indices: np.ndarray | None = None
 
         # Setup delta_indices (doesn't depend on hf_dataset)
         self.delta_indices = None
@@ -107,13 +124,168 @@ class DatasetReader:
     def _build_index_mapping(self) -> None:
         """Build absolute-to-relative index mapping from loaded hf_dataset."""
         self._absolute_to_relative_idx = None
-        if self.episodes is not None and self.hf_dataset is not None:
+        self._sample_relative_indices = None
+        if (self.episodes is not None or self._sample_manifest_rows is not None) and self.hf_dataset is not None:
             indices = self.hf_dataset.data.column("index").to_numpy()
-            self._absolute_to_relative_idx = dict(zip(indices.tolist(), range(len(indices)), strict=True))
+            identity_mapping = (
+                self.episodes is None
+                and len(indices) == self._meta.total_frames
+                and (len(indices) == 0 or (int(indices[0]) == 0 and int(indices[-1]) == len(indices) - 1))
+                and (len(indices) < 2 or np.all(np.diff(indices) == 1))
+            )
+            if not identity_mapping:
+                self._absolute_to_relative_idx = dict(
+                    zip(indices.tolist(), range(len(indices)), strict=True)
+                )
+        if self._sample_manifest_rows is not None:
+            self._validate_and_map_sample_manifest()
+
+    def _load_sample_manifest(self) -> SampleManifest | None:
+        """Load and metadata-validate a read-only anchor manifest."""
+        if self.sample_indices_path is None:
+            return None
+        if not self.sample_indices_path.is_file():
+            raise FileNotFoundError(f"Sample indices manifest not found: {self.sample_indices_path}")
+
+        required = {"index", "episode_index", "frame_index"}
+        schema = pq.read_schema(self.sample_indices_path)
+        missing = sorted(required.difference(schema.names))
+        if missing:
+            raise ValueError(
+                f"Sample indices manifest {self.sample_indices_path} is missing columns: {missing}."
+            )
+        table = pq.read_table(self.sample_indices_path, columns=sorted(required))
+        if table.num_rows == 0:
+            raise ValueError(f"Sample indices manifest {self.sample_indices_path} is empty.")
+
+        columns: dict[str, np.ndarray] = {}
+        for key in required:
+            column = table.column(key).combine_chunks()
+            if column.null_count or not np.issubdtype(column.to_numpy(zero_copy_only=False).dtype, np.integer):
+                raise ValueError(
+                    f"Sample indices manifest column {key!r} must contain non-null integers."
+                )
+            columns[key] = column.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+
+        indices = columns["index"]
+        episode_indices = columns["episode_index"]
+        frame_indices = columns["frame_index"]
+        if len(indices) > 1:
+            differences = np.diff(indices)
+            monotonic_unique = np.all(differences > 0) or np.all(differences < 0)
+            if not monotonic_unique:
+                unique_indices, counts = np.unique(indices, return_counts=True)
+                duplicates = unique_indices[counts > 1]
+                if duplicates.size:
+                    raise ValueError(
+                        f"Sample indices manifest contains duplicate index {int(duplicates[0])}."
+                    )
+
+        invalid_index = np.flatnonzero((indices < 0) | (indices >= self._meta.total_frames))
+        if invalid_index.size:
+            value = int(indices[invalid_index[0]])
+            raise ValueError(
+                f"Sample indices manifest index {value} is outside [0, {self._meta.total_frames})."
+            )
+        invalid_episode = np.flatnonzero(
+            (episode_indices < 0) | (episode_indices >= self._meta.total_episodes)
+        )
+        if invalid_episode.size:
+            value = int(episode_indices[invalid_episode[0]])
+            raise ValueError(
+                f"Sample indices manifest episode_index {value} is outside "
+                f"[0, {self._meta.total_episodes})."
+            )
+
+        episode_starts = np.fromiter(
+            (
+                int(self._meta.episodes[episode_index]["dataset_from_index"])
+                for episode_index in range(self._meta.total_episodes)
+            ),
+            dtype=np.int64,
+            count=self._meta.total_episodes,
+        )
+        episode_ends = np.fromiter(
+            (
+                int(self._meta.episodes[episode_index]["dataset_to_index"])
+                for episode_index in range(self._meta.total_episodes)
+            ),
+            dtype=np.int64,
+            count=self._meta.total_episodes,
+        )
+        starts = episode_starts[episode_indices]
+        ends = episode_ends[episode_indices]
+        expected_frames = indices - starts
+        mismatch = np.flatnonzero(
+            (indices < starts) | (indices >= ends) | (frame_indices != expected_frames)
+        )
+        if mismatch.size:
+            row_idx = int(mismatch[0])
+            raise ValueError(
+                f"Sample indices manifest row {row_idx} does not match dataset metadata: "
+                f"index={int(indices[row_idx])}, "
+                f"episode_index={int(episode_indices[row_idx])}, "
+                f"frame_index={int(frame_indices[row_idx])}; "
+                f"expected index in [{int(starts[row_idx])}, {int(ends[row_idx])}) "
+                f"and frame_index={int(expected_frames[row_idx])}."
+            )
+
+        if self.episodes is not None:
+            selected = np.isin(episode_indices, np.asarray(self.episodes, dtype=np.int64))
+            indices = indices[selected]
+            episode_indices = episode_indices[selected]
+            frame_indices = frame_indices[selected]
+        if not len(indices):
+            raise ValueError("Sample indices manifest has no rows after applying the episodes filter.")
+        return SampleManifest(indices, episode_indices, frame_indices)
+
+    def _validate_and_map_sample_manifest(self) -> None:
+        """Validate manifest rows against loaded parquet values and build public-index mapping."""
+        if self.hf_dataset is None or self._sample_manifest_rows is None:
+            return
+        manifest = self._sample_manifest_rows
+        episode_values = self.hf_dataset.data.column("episode_index").to_numpy()
+        frame_values = self.hf_dataset.data.column("frame_index").to_numpy()
+        if self._absolute_to_relative_idx is None:
+            relative_indices = manifest.indices
+        else:
+            relative_indices = np.fromiter(
+                (
+                    self._absolute_to_relative_idx.get(int(abs_idx), -1)
+                    for abs_idx in manifest.indices
+                ),
+                dtype=np.int64,
+                count=len(manifest),
+            )
+            missing = np.flatnonzero(relative_indices < 0)
+            if missing.size:
+                abs_idx = int(manifest.indices[missing[0]])
+                raise ValueError(
+                    f"Sample indices manifest index {abs_idx} is unavailable after applying episodes filter."
+                )
+        mismatch = np.flatnonzero(
+            (episode_values[relative_indices] != manifest.episode_indices)
+            | (frame_values[relative_indices] != manifest.frame_indices)
+        )
+        if mismatch.size:
+            row_idx = int(mismatch[0])
+            relative_idx = int(relative_indices[row_idx])
+            actual = (int(episode_values[relative_idx]), int(frame_values[relative_idx]))
+            expected = (
+                int(manifest.episode_indices[row_idx]),
+                int(manifest.frame_indices[row_idx]),
+            )
+            raise ValueError(
+                f"Sample indices manifest index {int(manifest.indices[row_idx])} "
+                f"maps to {actual}, expected {expected}."
+            )
+        self._sample_relative_indices = relative_indices
 
     @property
     def num_frames(self) -> int:
         """Number of frames in selected episodes."""
+        if self._sample_manifest_rows is not None:
+            return len(self._sample_manifest_rows)
         if self.episodes is not None and self.hf_dataset is not None:
             return len(self.hf_dataset)
         return self._meta.total_frames
@@ -121,6 +293,8 @@ class DatasetReader:
     @property
     def num_episodes(self) -> int:
         """Number of episodes selected."""
+        if self._sample_manifest_rows is not None:
+            return int(np.unique(self._sample_manifest_rows.episode_indices).size)
         return len(self.episodes) if self.episodes is not None else self._meta.total_episodes
 
     def _load_hf_dataset(self) -> datasets.Dataset:
@@ -261,6 +435,25 @@ class DatasetReader:
             futures = [pool.submit(_decode_single, k, ts) for k, ts in items]
             return dict(f.result() for f in futures)
 
+    def _resolve_public_index(self, idx: int) -> int:
+        if self._sample_relative_indices is None:
+            return idx
+        idx = int(idx)
+        if not -len(self._sample_relative_indices) <= idx < len(self._sample_relative_indices):
+            raise IndexError(idx)
+        return self._sample_relative_indices[idx]
+
+    def select_columns(self, column_names: str | list[str]) -> datasets.Dataset:
+        """Select columns while preserving the public manifest subset and order."""
+        dataset = self.hf_dataset
+        if self._sample_relative_indices is not None:
+            dataset = dataset.select(self._sample_relative_indices)
+        return dataset.select_columns(column_names)
+
+    def get_raw_item(self, idx: int) -> dict:
+        """Get a raw row through the public manifest index mapping."""
+        return self.hf_dataset[self._resolve_public_index(idx)]
+
     def get_item(self, idx) -> dict:
         """Core __getitem__ logic. Assumes hf_dataset is loaded.
 
@@ -268,7 +461,7 @@ class DatasetReader:
         HF dataset, **not** the absolute frame index stored in the ``index``
         column.  The absolute index is retrieved from the row itself.
         """
-        item = self.hf_dataset[idx]
+        item = self.hf_dataset[self._resolve_public_index(idx)]
         ep_idx = item["episode_index"].item()
         abs_idx = item["index"].item()
 

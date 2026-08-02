@@ -17,7 +17,12 @@ from lerobot.configs.default import DatasetConfig
 
 
 def test_dataset_config_valid():
-    DatasetConfig(repo_id="user/repo", episodes=[0, 1, 2])
+    config = DatasetConfig(
+        repo_id="user/repo",
+        episodes=[0, 1, 2],
+        sample_indices_path="/tmp/anchors.parquet",
+    )
+    assert config.sample_indices_path == "/tmp/anchors.parquet"
 
 
 def test_dataset_config_negative_episodes():

@@ -42,6 +42,7 @@ def test_molmoact2_policy_registration():
     assert cfg.per_episode_seed is False
     assert cfg.eval_seed is None
     assert cfg.normalize_language is True
+    assert cfg.goal_pose_feature_key == OBS_STATE
     assert cfg.get_scheduler_preset().num_decay_steps is None
     assert cfg.action_delta_indices == list(range(cfg.chunk_size))
     assert get_policy_class("molmoact2") is MolmoAct2Policy
@@ -145,6 +146,52 @@ def test_clean_vlm_bootstrap_loads_vlm_and_resets_action_expert(tmp_path, monkey
     assert torch.equal(policy.model.model.action_expert.weight, torch.full((2, 2), 0.25))
     assert policy.bootstrap_audit["loaded_exact"] == 1
     assert policy.bootstrap_audit["loaded_partial"] == 1
+
+
+def test_goal_prior_checkpoint_loading_allowlist_is_fail_closed():
+    stage2 = SimpleNamespace(
+        enable_goal_pose=True,
+        goal_conditioning_mode="semantic_visual_recurrent",
+    )
+    molmoact2_modeling._validate_goal_prior_loading_keys(
+        stage2,
+        {
+            "semantic_visual_aggregator.queries",
+            "semantic_visual_pose_decoder.net.0.weight",
+        },
+        {"goal_se3_encoder.net.0.weight"},
+    )
+
+    with pytest.raises(RuntimeError, match="action_expert"):
+        molmoact2_modeling._validate_goal_prior_loading_keys(
+            stage2,
+            {"model.action_expert.blocks.0.weight"},
+            {"goal_se3_encoder.net.0.weight"},
+        )
+
+    stage1 = SimpleNamespace(enable_goal_pose=True, goal_conditioning_mode="vlm_appended")
+    with pytest.raises(RuntimeError, match="goal_se3_encoder"):
+        molmoact2_modeling._validate_goal_prior_loading_keys(
+            stage1,
+            set(),
+            {"goal_se3_encoder.net.0.weight"},
+        )
+
+
+def test_action_expert_checkpoint_fingerprint_matches_loaded_module(tmp_path):
+    action_expert = torch.nn.Linear(5, 3)
+    model_path = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "model.model.action_expert.weight": action_expert.weight.detach(),
+            "model.model.action_expert.bias": action_expert.bias.detach(),
+        },
+        model_path,
+    )
+
+    assert molmoact2_modeling._checkpoint_action_expert_fingerprint(
+        model_path
+    ) == molmoact2_modeling._module_fingerprint(action_expert)
 
 
 def test_disable_visual_input_does_not_require_camera_keys():
@@ -584,24 +631,28 @@ def test_semantic_visual_pose_reconstruction_uses_all_tokens_and_pad_mask():
         policy._compute_pose_reconstruction_loss(batch, torch.randn(2, 8, 32))
 
 
-def test_extract_state_and_goal_pose_from_multi_frame_state():
+def test_extract_independent_7d_goal_and_8d_current_state_with_padding():
     step = object.__new__(MolmoAct2PackInputsProcessorStep)
     step.enable_goal_pose = True
-    observation = {OBS_STATE: torch.randn(2, 3, 8)}
+    step.goal_pose_feature_key = "observation.goal_pose"
+    observation = {
+        OBS_STATE: torch.randn(2, 8),
+        "observation.goal_pose": torch.randn(2, 2, 7),
+    }
 
     current = step._extract_state(observation, 2)
     assert current.shape == (2, 8)
-    assert torch.equal(current, observation[OBS_STATE][:, 0])
+    assert torch.equal(current, observation[OBS_STATE])
 
     complementary = {
-        "observation.state_is_pad": torch.tensor([[False, False, True], [False, False, False]])
+        "observation.goal_pose_is_pad": torch.tensor([[False, True], [False, False]])
     }
     goal_pose, goal_pose_is_pad = step._extract_goal_pose(observation, complementary, 2)
-    assert goal_pose.shape == (2, 8)
-    assert torch.equal(goal_pose, observation[OBS_STATE][:, -1])
+    assert goal_pose.shape == (2, 7)
+    assert torch.equal(goal_pose, observation["observation.goal_pose"][:, -1])
     assert goal_pose_is_pad.tolist() == [True, False]
 
-    # Single-frame state (inference) has no target frame.
+    # Inference has no future goal feature; state prompting remains available.
     assert step._extract_goal_pose({OBS_STATE: torch.randn(2, 8)}, {}, 2) == (None, None)
 
 
@@ -623,6 +674,68 @@ def test_resolve_delta_timestamps_adds_target_state_frame_only():
     assert delta["observation.state"] == pytest.approx([0.0, 1.0])
     # Cameras stay single-frame (no future image loading).
     assert "observation.images.image" not in delta
+
+
+def test_resolve_delta_timestamps_targets_independent_goal_feature():
+    from lerobot.datasets.factory import resolve_delta_timestamps
+
+    cfg = SimpleNamespace(
+        reward_delta_indices=None,
+        action_delta_indices=[0, 1],
+        observation_delta_indices=None,
+        target_pose_delta_index=10,
+        goal_pose_feature_key="observation.goal_pose",
+    )
+    ds_meta = SimpleNamespace(
+        features={
+            OBS_STATE: {},
+            "observation.goal_pose": {},
+            "observation.images.image": {},
+            ACTION: {},
+        },
+        fps=10.0,
+    )
+
+    delta = resolve_delta_timestamps(cfg, ds_meta)
+
+    assert OBS_STATE not in delta
+    assert delta["observation.goal_pose"] == pytest.approx([0.0, 1.0])
+    assert delta[ACTION] == pytest.approx([0.0, 0.1])
+
+
+def test_goal_pose_dim_is_inferred_from_independent_feature():
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+    policy.config = MolmoAct2Config(
+        input_features={
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+            "observation.goal_pose": PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+        },
+        goal_pose_feature_key="observation.goal_pose",
+    )
+
+    assert policy._goal_pose_dim() == 7
+
+
+def test_legacy_libero_goal_pose_defaults_to_observation_state():
+    legacy_config = {
+        "checkpoint_path": "/tmp/legacy-libero",
+        "action_mode": "continuous",
+        "enable_goal_pose": True,
+        "goal_token_source": "se3_encoder",
+        "target_pose_delta_index": 10,
+        "input_features": {
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+        },
+    }
+
+    config = MolmoAct2Config(**legacy_config)
+    policy = object.__new__(MolmoAct2Policy)
+    torch.nn.Module.__init__(policy)
+    policy.config = config
+
+    assert config.goal_pose_feature_key == OBS_STATE
+    assert policy._goal_pose_dim() == 8
 
 
 def test_molmoact2_rollout_generator_uses_eval_seed_per_task():
@@ -723,6 +836,50 @@ def test_molmoact2_gripper_mask_uses_feature_names(tmp_path):
     unnormalized = unnormalizer({TransitionKey.ACTION: torch.tensor([[0.0, 7.0]])})
 
     assert torch.equal(unnormalized[TransitionKey.ACTION], torch.tensor([[5.0, 7.0]]))
+
+
+def test_independent_goal_feature_has_own_normalization_and_gripper_mask():
+    goal_key = "observation.goal_pose"
+    stats = {
+        OBS_STATE: {"q01": [0.0] * 8, "q99": [10.0] * 8},
+        goal_key: {"q01": [0.0] * 7, "q99": [20.0] * 7},
+    }
+    names = {
+        OBS_STATE: [f"state_{idx}" for idx in range(7)] + ["state_gripper"],
+        goal_key: [f"pose_{idx}" for idx in range(6)] + ["goal_gripper"],
+    }
+    masked_stats = _add_gripper_masks_to_stats(
+        stats,
+        None,
+        normalize_gripper=False,
+        dataset_feature_names=names,
+        goal_pose_feature_key=goal_key,
+    )
+    features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+        goal_key: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+    }
+    normalizer = MolmoAct2MaskedNormalizerProcessorStep(
+        features=features,
+        norm_map={FeatureType.STATE: NormalizationMode.QUANTILES},
+        stats=masked_stats,
+    )
+    transition = {
+        TransitionKey.OBSERVATION: {
+            OBS_STATE: torch.tensor([[5.0] * 7 + [9.0]]),
+            goal_key: torch.tensor([[[10.0] * 6 + [11.0], [15.0] * 6 + [12.0]]]),
+        }
+    }
+
+    normalized = normalizer(transition)[TransitionKey.OBSERVATION]
+
+    assert torch.equal(normalized[OBS_STATE], torch.tensor([[0.0] * 7 + [9.0]]))
+    assert torch.equal(
+        normalized[goal_key],
+        torch.tensor([[[0.0] * 6 + [11.0], [0.5] * 6 + [12.0]]]),
+    )
+    assert masked_stats[OBS_STATE]["mask"] == [True] * 7 + [False]
+    assert masked_stats[goal_key]["mask"] == [True] * 6 + [False]
 
 
 def test_molmoact2_normalize_gripper_true_keeps_all_dims_normalized(tmp_path):

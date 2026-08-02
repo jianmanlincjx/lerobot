@@ -170,10 +170,13 @@ class MolmoAct2Config(PreTrainedConfig):
     num_goal_tokens: int = 4
     goal_token_source: str = "se3_encoder"  # "se3_encoder" (Stage 1) | "learnable_queries" (Stage 2)
     goal_hidden_dim: int = 512
-    # Frame offset (relative to the current frame) whose observation.state defines the
-    # target pose. Defaults to chunk_size (s_{t+H}) at training time; must be set when
-    # goal-pose is enabled and a target is needed (Stage 1, or Stage 2 pose reconstruction).
+    # Frame offset (relative to the current frame) whose configured goal feature defines
+    # the target pose. Must be set when goal-pose is enabled and a target is needed
+    # (Stage 1, or Stage 2 pose reconstruction).
     target_pose_delta_index: int | None = None
+    # Dataset feature used for the future goal target. The legacy default keeps existing
+    # LIBERO configs/checkpoints unchanged; DROID can point this at an independent 7-D pose.
+    goal_pose_feature_key: str = OBS_STATE
     mask_image_from_action_expert: bool = False
     enable_pose_reconstruction: bool = False
     pose_recon_loss_weight: float = 1.0
@@ -362,6 +365,8 @@ class MolmoAct2Config(PreTrainedConfig):
                 f"Unsupported goal_token_source={self.goal_token_source!r}. "
                 "Expected 'se3_encoder' or 'learnable_queries'."
             )
+        if not str(self.goal_pose_feature_key).strip():
+            raise ValueError("goal_pose_feature_key must be a non-empty dataset feature key.")
         if self.goal_conditioning_mode not in {"vlm_appended", "semantic_visual_recurrent"}:
             raise ValueError(
                 f"Unsupported goal_conditioning_mode={self.goal_conditioning_mode!r}. "
@@ -524,7 +529,7 @@ class MolmoAct2Config(PreTrainedConfig):
 
     def set_dataset_feature_metadata(self, features: dict[str, Any]) -> None:
         self.dataset_feature_names = {}
-        for key in (ACTION, OBS_STATE):
+        for key in dict.fromkeys((ACTION, OBS_STATE, self.goal_pose_feature_key)):
             feature = features.get(key) if isinstance(features, dict) else None
             if isinstance(feature, dict) and feature.get("names") is not None:
                 self.dataset_feature_names[key] = feature["names"]

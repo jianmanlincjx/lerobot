@@ -388,12 +388,13 @@ def _add_gripper_masks_to_stats(
     *,
     normalize_gripper: bool,
     dataset_feature_names: dict[str, Any] | None = None,
+    goal_pose_feature_key: str = OBS_STATE,
 ) -> dict[str, dict[str, Any]] | None:
     if not dataset_stats:
         return dataset_stats
 
     stats = deepcopy(dataset_stats)
-    for key in (ACTION, OBS_STATE):
+    for key in dict.fromkeys((ACTION, OBS_STATE, goal_pose_feature_key)):
         feature_stats = stats.get(key)
         if not isinstance(feature_stats, dict):
             continue
@@ -452,12 +453,16 @@ class MolmoAct2MaskedUnnormalizerProcessorStep(_MolmoAct2MaskedNormalizationMixi
 class MolmoAct2ClampNormalizedProcessorStep(ProcessorStep):
     """Clamp q01/q99-normalized state and action to the range used by the old trainer."""
 
+    goal_pose_feature_key: str = OBS_STATE
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
         observation = transition.get(TransitionKey.OBSERVATION)
-        if isinstance(observation, dict) and OBS_STATE in observation:
+        if isinstance(observation, dict):
             observation = observation.copy()
-            observation[OBS_STATE] = torch.as_tensor(observation[OBS_STATE]).clamp(-1.0, 1.0)
+            for key in dict.fromkeys((OBS_STATE, self.goal_pose_feature_key)):
+                if key in observation:
+                    observation[key] = torch.as_tensor(observation[key]).clamp(-1.0, 1.0)
             transition[TransitionKey.OBSERVATION] = observation
         action = transition.get(TransitionKey.ACTION)
         if action is not None:
@@ -482,6 +487,7 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
     image_keys: list[str] = field(default_factory=list)
     disable_visual_input: bool = False
     enable_goal_pose: bool = False
+    goal_pose_feature_key: str = OBS_STATE
     setup_type: str = ""
     control_mode: str = ""
     normalize_language: bool = True
@@ -531,6 +537,7 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
             "image_keys": list(self.image_keys),
             "disable_visual_input": self.disable_visual_input,
             "enable_goal_pose": self.enable_goal_pose,
+            "goal_pose_feature_key": self.goal_pose_feature_key,
             "setup_type": self.setup_type,
             "control_mode": self.control_mode,
             "normalize_language": self.normalize_language,
@@ -608,9 +615,9 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
         state = torch.as_tensor(observation[OBS_STATE], dtype=torch.float32)
         if state.ndim == 1:
             state = state.unsqueeze(0)
-        # With goal-pose enabled, observation.state carries a time axis (B, T, D) where index 0
-        # is the current frame and the last index is the chunk-end target. Use the current frame
-        # for discrete state prompting; the target is consumed separately by _extract_goal_pose.
+        # The legacy goal key is observation.state, which gives it a (B, T, D) time axis.
+        # Index 0 is always the current frame used for prompting; the future frame is
+        # consumed separately by _extract_goal_pose.
         if state.ndim == 3:
             state = state[:, 0]
         if int(state.shape[0]) != batch_size:
@@ -620,19 +627,22 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
     def _extract_goal_pose(
         self, observation: dict[str, Any], complementary: dict[str, Any], batch_size: int
     ) -> tuple[Tensor, Tensor] | tuple[None, None]:
-        """Return (goal_pose, goal_pose_is_pad) from the chunk-end observation.state frame.
+        """Return (goal_pose, goal_pose_is_pad) from the configured future goal frame.
 
-        Requires observation.state loaded with a time axis (see resolve_delta_timestamps with
-        target_pose_delta_index). Returns (None, None) when no target frame is available (e.g.
-        at inference, where goal tokens come from learnable queries and no pose target exists).
+        Requires the goal feature loaded with a time axis (see resolve_delta_timestamps with
+        target_pose_delta_index). Returns (None, None) when no target feature/frame is available
+        (e.g. at inference, where goal tokens come from learnable queries).
         """
-        state = torch.as_tensor(observation[OBS_STATE], dtype=torch.float32)
-        if state.ndim != 3 or state.shape[1] < 2:
+        raw_goal = observation.get(self.goal_pose_feature_key)
+        if raw_goal is None:
             return None, None
-        goal_pose = state[:, -1]  # normalized chunk-end target state vector (B, D)
-        state_is_pad = complementary.get("observation.state_is_pad")
-        if state_is_pad is not None:
-            pad = torch.as_tensor(state_is_pad, dtype=torch.bool)
+        goal = torch.as_tensor(raw_goal, dtype=torch.float32)
+        if goal.ndim != 3 or goal.shape[1] < 2:
+            return None, None
+        goal_pose = goal[:, -1]
+        goal_is_pad = complementary.get(f"{self.goal_pose_feature_key}_is_pad")
+        if goal_is_pad is not None:
+            pad = torch.as_tensor(goal_is_pad, dtype=torch.bool)
             goal_pose_is_pad = pad[:, -1] if pad.ndim == 2 else pad.reshape(-1)[:1].expand(batch_size)
         else:
             goal_pose_is_pad = torch.zeros(batch_size, dtype=torch.bool)
@@ -869,6 +879,7 @@ def make_molmoact2_pre_post_processors(
         dataset_meta,
         normalize_gripper=config.normalize_gripper,
         dataset_feature_names=config.dataset_feature_names,
+        goal_pose_feature_key=config.goal_pose_feature_key,
     )
 
     input_steps: list[ProcessorStep] = [
@@ -879,7 +890,7 @@ def make_molmoact2_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=masked_dataset_stats,
         ),
-        MolmoAct2ClampNormalizedProcessorStep(),
+        MolmoAct2ClampNormalizedProcessorStep(goal_pose_feature_key=config.goal_pose_feature_key),
         MolmoAct2PackInputsProcessorStep(
             checkpoint_path=config.checkpoint_path,
             checkpoint_revision=config.checkpoint_revision,
@@ -890,6 +901,7 @@ def make_molmoact2_pre_post_processors(
             image_keys=image_keys,
             disable_visual_input=config.disable_visual_input,
             enable_goal_pose=config.enable_goal_pose,
+            goal_pose_feature_key=config.goal_pose_feature_key,
             setup_type=setup_type,
             control_mode=control_mode,
             normalize_language=config.normalize_language,

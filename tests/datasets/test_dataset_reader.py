@@ -15,12 +15,30 @@
 # limitations under the License.
 """Contract tests for DatasetReader."""
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
+import torch
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.datasets.dataset_reader import DatasetReader
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import get_safe_default_codec
+
+
+def _write_sample_manifest(path, rows):
+    pq.write_table(
+        pa.table(
+            {
+                "index": [row["index"] for row in rows],
+                "episode_index": [row["episode_index"] for row in rows],
+                "frame_index": [row["frame_index"] for row in rows],
+            }
+        ),
+        path,
+    )
 
 # ── Loading ──────────────────────────────────────────────────────────
 
@@ -170,3 +188,81 @@ def test_get_episodes_file_paths_includes_video_paths(tmp_path, lerobot_dataset_
     if len(dataset.meta.video_keys) > 0:
         paths = dataset.reader.get_episodes_file_paths()
         assert any("video" in str(p).lower() for p in paths)
+
+
+def test_sample_manifest_maps_public_indices_and_preserves_absolute_delta_queries(
+    tmp_path, lerobot_dataset_factory
+):
+    base = lerobot_dataset_factory(
+        root=tmp_path / "ds", total_episodes=2, total_frames=20, use_videos=False
+    )
+    anchors = []
+    for abs_idx in range(len(base)):
+        row = base.get_raw_item(abs_idx)
+        if int(row["frame_index"]) == 1:
+            anchors.append(
+                {
+                    "index": int(row["index"]),
+                    "episode_index": int(row["episode_index"]),
+                    "frame_index": int(row["frame_index"]),
+                }
+            )
+    anchors.reverse()
+    manifest_path = tmp_path / "anchors.parquet"
+    _write_sample_manifest(manifest_path, anchors)
+
+    sampled = LeRobotDataset(
+        base.repo_id,
+        root=base.root,
+        sample_indices_path=manifest_path,
+        delta_timestamps={ACTION: [0.0, 1.0 / base.fps]},
+    )
+
+    assert len(sampled) == len(anchors) == 2
+    assert [int(sampled[idx]["index"]) for idx in range(len(sampled))] == [
+        row["index"] for row in anchors
+    ]
+    assert int(sampled.get_raw_item(0)["index"]) == anchors[0]["index"]
+    assert sampled.select_columns("index")[:]["index"] == [row["index"] for row in anchors]
+    first = sampled[0]
+    anchor_idx = anchors[0]["index"]
+    assert torch.equal(first[ACTION][0], base.get_raw_item(anchor_idx)[ACTION])
+    assert torch.equal(first[ACTION][1], base.get_raw_item(anchor_idx + 1)[ACTION])
+
+    episode_filtered = LeRobotDataset(
+        base.repo_id,
+        root=base.root,
+        episodes=[1],
+        sample_indices_path=manifest_path,
+        delta_timestamps={ACTION: [0.0, 1.0 / base.fps]},
+    )
+    assert len(episode_filtered) == 1
+    assert int(episode_filtered[0]["episode_index"]) == 1
+
+
+@pytest.mark.parametrize("invalid_kind", ["duplicate", "out_of_range", "mismatch"])
+def test_sample_manifest_strict_validation(tmp_path, lerobot_dataset_factory, invalid_kind):
+    base = lerobot_dataset_factory(
+        root=tmp_path / invalid_kind,
+        total_episodes=2,
+        total_frames=20,
+        use_videos=False,
+    )
+    raw = base.get_raw_item(1)
+    row = {
+        "index": int(raw["index"]),
+        "episode_index": int(raw["episode_index"]),
+        "frame_index": int(raw["frame_index"]),
+    }
+    rows = [row]
+    if invalid_kind == "duplicate":
+        rows.append(row.copy())
+    elif invalid_kind == "out_of_range":
+        rows[0]["index"] = base.meta.total_frames
+    else:
+        rows[0]["frame_index"] += 1
+    manifest_path = tmp_path / f"{invalid_kind}.parquet"
+    _write_sample_manifest(manifest_path, rows)
+
+    with pytest.raises(ValueError):
+        LeRobotDataset(base.repo_id, root=base.root, sample_indices_path=manifest_path)

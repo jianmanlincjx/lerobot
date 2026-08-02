@@ -119,10 +119,12 @@ def _maybe_overlay_goal_pose_frames(
     )
 
     pose_np = pose.detach().float().cpu().numpy()
-    stats = getattr(getattr(policy, "config", None), "dataset_stats", None)
-    if isinstance(stats, dict) and "observation.state" in stats:
-        q01 = np.asarray(stats["observation.state"].get("q01"), dtype=np.float64)
-        q99 = np.asarray(stats["observation.state"].get("q99"), dtype=np.float64)
+    policy_config = getattr(policy, "config", None)
+    stats = getattr(policy_config, "dataset_stats", None)
+    goal_key = getattr(policy_config, "goal_pose_feature_key", "observation.state")
+    if isinstance(stats, dict) and goal_key in stats:
+        q01 = np.asarray(stats[goal_key].get("q01"), dtype=np.float64)
+        q99 = np.asarray(stats[goal_key].get("q99"), dtype=np.float64)
         if q01 is not None and q99 is not None and np.asarray(q01).shape[-1] >= 3:
             q01 = np.asarray(q01, dtype=np.float64)
             q99 = np.asarray(q99, dtype=np.float64)

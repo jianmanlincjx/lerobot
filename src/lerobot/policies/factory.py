@@ -308,6 +308,7 @@ def make_pre_post_processors(
                 kwargs.get("dataset_meta"),
                 normalize_gripper=policy_cfg.normalize_gripper,
                 dataset_feature_names=policy_cfg.dataset_feature_names,
+                goal_pose_feature_key=policy_cfg.goal_pose_feature_key,
             )
             if "molmoact2_masked_normalizer" in preprocessor_overrides:
                 preprocessor_overrides["molmoact2_masked_normalizer"]["stats"] = masked_stats
@@ -321,6 +322,7 @@ def make_pre_post_processors(
                     "image_keys": list(policy_cfg.image_keys),
                     "disable_visual_input": policy_cfg.disable_visual_input,
                     "enable_goal_pose": policy_cfg.enable_goal_pose,
+                    "goal_pose_feature_key": policy_cfg.goal_pose_feature_key,
                     "setup_type": policy_cfg.setup_type,
                     "control_mode": policy_cfg.control_mode,
                     "chunk_size": policy_cfg.chunk_size,
@@ -328,6 +330,11 @@ def make_pre_post_processors(
                 }
             )
             preprocessor_overrides["molmoact2_pack_inputs"] = pack_overrides
+            clamp_overrides = dict(
+                preprocessor_overrides.get("molmoact2_clamp_normalized", {})
+            )
+            clamp_overrides["goal_pose_feature_key"] = policy_cfg.goal_pose_feature_key
+            preprocessor_overrides["molmoact2_clamp_normalized"] = clamp_overrides
             kwargs["preprocessor_overrides"] = preprocessor_overrides
 
             postprocessor_overrides = dict(kwargs.get("postprocessor_overrides", {}))

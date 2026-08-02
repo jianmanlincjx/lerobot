@@ -50,10 +50,10 @@ def resolve_delta_timestamps(
             }
             returns `None` if the resulting dict is empty.
     """
-    # Optional: load a future observation.state frame (the chunk-end target pose) for
-    # goal-conditioned policies (e.g. MolmoAct2 goal-pose prior) WITHOUT pulling extra
-    # image frames. This is applied only to observation.state so cameras stay single-frame.
+    # Optional: load a future frame from the configured goal feature (the chunk-end
+    # target pose) WITHOUT pulling extra image frames.
     target_pose_delta_index = getattr(cfg, "target_pose_delta_index", None)
+    goal_pose_feature_key = getattr(cfg, "goal_pose_feature_key", OBS_STATE)
 
     delta_timestamps = {}
     for key in ds_meta.features:
@@ -63,7 +63,7 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
-        if key == OBS_STATE and target_pose_delta_index is not None:
+        if key == goal_pose_feature_key and target_pose_delta_index is not None:
             base_indices = (
                 list(cfg.observation_delta_indices)
                 if cfg.observation_delta_indices is not None
@@ -72,6 +72,11 @@ def resolve_delta_timestamps(
             # Current frame stays at index 0; the target pose is appended as the last index.
             indices = base_indices + [int(target_pose_delta_index)]
             delta_timestamps[key] = [i / ds_meta.fps for i in indices]
+
+    if target_pose_delta_index is not None and goal_pose_feature_key not in ds_meta.features:
+        raise ValueError(
+            f"Configured goal_pose_feature_key={goal_pose_feature_key!r} is missing from dataset features."
+        )
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
@@ -105,6 +110,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
+                sample_indices_path=cfg.dataset.sample_indices_path,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
@@ -113,6 +119,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
             )
         else:
+            if cfg.dataset.sample_indices_path is not None:
+                raise ValueError("sample_indices_path is only supported for non-streaming datasets.")
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,

@@ -62,6 +62,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        sample_indices_path: str | Path | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -187,6 +188,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encoder_threads (int | None, optional): Number of threads per encoder instance. None lets the
                 codec auto-detect (default). Lower values reduce CPU usage per encoder. Maps to 'lp' (via svtav1-params) for
                 libsvtav1 and 'threads' for h264/hevc.
+            sample_indices_path (str | Path | None, optional): Read-only parquet manifest selecting
+                public training samples by original ``index``, ``episode_index``, and ``frame_index``.
+                Delta queries still use the original absolute dataset index. Defaults to None.
 
         Note:
             Write-mode parameters (``streaming_encoding``, ``batch_encoding_size``) passed to
@@ -200,6 +204,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.set_image_transforms(image_transforms)
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
+        self.sample_indices_path = Path(sample_indices_path).expanduser() if sample_indices_path else None
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self._video_backend = video_backend if video_backend else get_safe_default_codec()
@@ -228,6 +233,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             return_uint8=self._return_uint8,
+            sample_indices_path=self.sample_indices_path,
         )
 
         # Load actual data
@@ -292,6 +298,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 delta_timestamps=self.delta_timestamps,
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
+                sample_indices_path=self.sample_indices_path,
             )
         return self.reader
 
@@ -463,7 +470,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Useful for extracting action sequences during replay without loading all features.
         Returns a ``datasets.Dataset`` containing only the requested columns.
         """
-        return self.hf_dataset.select_columns(column_names)
+        reader = self._ensure_reader()
+        if reader.hf_dataset is None:
+            reader.load_and_activate()
+        return reader.select_columns(column_names)
 
     def get_raw_item(self, idx) -> dict:
         """Get a raw frame without image transforms applied.
@@ -471,7 +481,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Unlike ``__getitem__``, this returns the raw HF dataset row at the given
         index with no delta-timestamp expansion, video decoding, or image transforms.
         """
-        return self.hf_dataset[idx]
+        reader = self._ensure_reader()
+        if reader.hf_dataset is None:
+            reader.load_and_activate()
+        return reader.get_raw_item(idx)
 
     def __repr__(self):
         feature_keys = list(self.features)
@@ -690,6 +703,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.image_transforms = None
         obj.delta_timestamps = None
         obj.episodes = None
+        obj.sample_indices_path = None
         obj._video_backend = video_backend if video_backend is not None else get_safe_default_codec()
         obj._return_uint8 = False
         obj._batch_encoding_size = batch_encoding_size
@@ -783,6 +797,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.image_transforms = None
         obj.delta_timestamps = None
         obj.episodes = None
+        obj.sample_indices_path = None
         obj._video_backend = video_backend if video_backend else get_safe_default_codec()
         obj._return_uint8 = False
         obj._batch_encoding_size = batch_encoding_size

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
 import os
 import types
@@ -20,7 +20,7 @@ from torch import Tensor
 from torch.distributions import Beta
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
 from ..rtc.modeling_rtc import RTCProcessor
@@ -121,14 +121,77 @@ def _torch_dtype(dtype: str) -> torch.dtype:
 def _module_fingerprint(module: torch.nn.Module) -> str:
     """Cheap deterministic fingerprint for auditing initialization/weight transfer."""
     digest = hashlib.sha256()
-    for name, tensor in module.state_dict().items():
-        value = tensor.detach().reshape(-1).cpu()
+    for name, tensor in sorted(module.state_dict().items()):
+        value = tensor.detach().reshape(-1)
         digest.update(name.encode())
         digest.update(str(tuple(tensor.shape)).encode())
         if value.numel():
-            sample = torch.cat((value[:16], value[-16:])).to(dtype=torch.float32)
+            sample = torch.cat((value[:16], value[-16:])).to(dtype=torch.float32, device="cpu")
             digest.update(sample.numpy().tobytes())
     return digest.hexdigest()
+
+
+def _checkpoint_action_expert_fingerprint(model_file: str | Path) -> str:
+    """Fingerprint Action Expert checkpoint slices without materializing full tensors."""
+    marker = ".action_expert."
+    digest = hashlib.sha256()
+    found = 0
+    with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+        for checkpoint_name in sorted(name for name in checkpoint.keys() if marker in name):
+            name = checkpoint_name.split(marker, 1)[1]
+            tensor_slice = checkpoint.get_slice(checkpoint_name)
+            shape = tuple(tensor_slice.get_shape())
+            digest.update(name.encode())
+            digest.update(str(shape).encode())
+            if shape and int(np.prod(shape)) > 0:
+                trailing_size = int(np.prod(shape[1:])) if len(shape) > 1 else 1
+                leading_count = min(shape[0], (16 + trailing_size - 1) // trailing_size)
+                remaining = (slice(None),) * (len(shape) - 1)
+                first_index = (slice(0, leading_count), *remaining)
+                last_index = (slice(shape[0] - leading_count, shape[0]), *remaining)
+                sample = torch.cat(
+                    (
+                        tensor_slice[first_index].reshape(-1)[:16],
+                        tensor_slice[last_index].reshape(-1)[-16:],
+                    )
+                ).to(dtype=torch.float32)
+                digest.update(sample.numpy().tobytes())
+            found += 1
+    if not found:
+        raise RuntimeError(f"Checkpoint has no Action Expert tensors: {model_file}")
+    return digest.hexdigest()
+
+
+def _validate_goal_prior_loading_keys(
+    config: MolmoAct2Config,
+    missing_keys: set[str],
+    unexpected_keys: set[str],
+) -> None:
+    """Fail closed on silent Stage-1/Stage-2 checkpoint topology mismatches."""
+    if not config.enable_goal_pose:
+        return
+    semantic_stage2 = config.goal_conditioning_mode == "semantic_visual_recurrent"
+    allowed_missing = (
+        (
+            "semantic_visual_aggregator.",
+            "semantic_visual_pose_norm.",
+            "semantic_visual_pose_decoder.",
+        )
+        if semantic_stage2
+        else ()
+    )
+    allowed_unexpected = ("goal_se3_encoder.",) if semantic_stage2 else ()
+    invalid_missing = sorted(
+        key for key in missing_keys if not key.startswith(allowed_missing)
+    )
+    invalid_unexpected = sorted(
+        key for key in unexpected_keys if not key.startswith(allowed_unexpected)
+    )
+    if invalid_missing or invalid_unexpected:
+        raise RuntimeError(
+            "Unsafe MolmoAct2 checkpoint topology mismatch: "
+            f"missing={invalid_missing}, unexpected={invalid_unexpected}"
+        )
 
 
 class _GoalSE3Encoder(torch.nn.Module):
@@ -962,6 +1025,34 @@ class MolmoAct2Policy(PreTrainedPolicy):
             self._apply_lora_adapters()
         self.init_rtc_processor()
 
+    def _validate_pretrained_loading(
+        self,
+        *,
+        model_file: str,
+        missing_keys: set[str],
+        unexpected_keys: set[str],
+    ) -> None:
+        _validate_goal_prior_loading_keys(self.config, missing_keys, unexpected_keys)
+        if not self.config.enable_goal_pose:
+            return
+        checkpoint_fingerprint = _checkpoint_action_expert_fingerprint(model_file)
+        loaded_fingerprint = _module_fingerprint(self._action_expert())
+        if loaded_fingerprint != checkpoint_fingerprint:
+            raise RuntimeError(
+                "Action Expert fingerprint differs after checkpoint loading; refusing to train "
+                "with an ambiguous Stage-1/Stage-2 lineage."
+            )
+        self._pretrained_lineage_audit = {
+            "model_file": str(model_file),
+            "missing_keys": sorted(missing_keys),
+            "unexpected_keys": sorted(unexpected_keys),
+            "action_expert_fingerprint": loaded_fingerprint,
+        }
+        logging.info(
+            "Validated goal-prior checkpoint lineage: Action Expert fingerprint=%s",
+            loaded_fingerprint,
+        )
+
     def _load_saved_policy_action_mode(self) -> str | None:
         pretrained_path = getattr(self.config, "pretrained_path", None)
         if pretrained_path is None:
@@ -1259,11 +1350,12 @@ class MolmoAct2Policy(PreTrainedPolicy):
         raise RuntimeError("Could not resolve MolmoAct2 backbone hidden size for goal-pose modules.")
 
     def _goal_pose_dim(self) -> int:
-        feature = self.config.robot_state_feature
+        goal_key = getattr(self.config, "goal_pose_feature_key", OBS_STATE)
+        feature = self.config.input_features.get(goal_key)
         pose_dim = int(feature.shape[0]) if feature is not None and feature.shape else 0
         if pose_dim < 1:
             raise ValueError(
-                "enable_goal_pose requires a positive observation.state dimension; "
+                f"enable_goal_pose requires a positive {goal_key!r} dimension; "
                 "none was found in policy input_features."
             )
         return pose_dim
@@ -1503,6 +1595,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
             "trainable_parameter_groups": group_counts,
             "trainable_parameters": sum(group_counts.values()),
             "total_parameters": sum(parameter.numel() for parameter in self.parameters()),
+            "pretrained_lineage": getattr(self, "_pretrained_lineage_audit", None),
         }
 
     def _model_inputs(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
