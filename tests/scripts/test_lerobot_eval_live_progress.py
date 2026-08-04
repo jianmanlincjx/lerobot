@@ -1,4 +1,9 @@
 import json
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
 
 from lerobot.scripts import lerobot_eval
 
@@ -6,6 +11,40 @@ from lerobot.scripts import lerobot_eval
 class _DummyEnv:
     def close(self):
         pass
+
+
+def test_goal_pose_quantiles_come_from_loaded_preprocessor():
+    policy = SimpleNamespace(
+        config=SimpleNamespace(goal_pose_feature_key="observation.state", dataset_stats=None)
+    )
+    preprocessor = SimpleNamespace(
+        steps=[
+            SimpleNamespace(stats=None),
+            SimpleNamespace(
+                stats={
+                    "observation.state": {
+                        "q01": torch.tensor([-0.4, -0.2, 0.04, 1.5, -2.7, -1.1]),
+                        "q99": torch.tensor([0.1, 0.3, 1.27, 3.3, 2.4, 0.6]),
+                    }
+                }
+            ),
+        ]
+    )
+
+    q01, q99 = lerobot_eval._goal_pose_quantiles(policy, preprocessor)
+
+    np.testing.assert_allclose(q01, [-0.4, -0.2, 0.04, 1.5, -2.7, -1.1])
+    np.testing.assert_allclose(q99, [0.1, 0.3, 1.27, 3.3, 2.4, 0.6])
+
+
+def test_goal_pose_quantiles_fail_closed_without_stats():
+    policy = SimpleNamespace(
+        config=SimpleNamespace(goal_pose_feature_key="observation.state", dataset_stats=None)
+    )
+    preprocessor = SimpleNamespace(steps=[SimpleNamespace(stats=None)])
+
+    with pytest.raises(RuntimeError, match="without saved q01/q99"):
+        lerobot_eval._goal_pose_quantiles(policy, preprocessor)
 
 
 def test_eval_policy_all_writes_realtime_task_accuracy(monkeypatch, tmp_path):

@@ -189,9 +189,10 @@ class MolmoAct2Config(PreTrainedConfig):
     # are appended to the AE context (not to the causal VLM sequence).
     goal_conditioning_mode: str = "vlm_appended"
     num_semantic_visual_tokens: int = 100
-    # v2 scheme-2a: the first `num_semantic_visual_pose_tokens` latent tokens form the
-    # goal-pose group (supervised by L_pose via a concat readout); the remaining tokens
-    # are the context group. All tokens still condition the action expert.
+    # Soft bottleneck (v2b/v3): first `num_semantic_visual_pose_tokens` get L_pose; the
+    # remaining tokens are unsupervised context; all tokens still condition the AE.
+    # Hard bottleneck (v4): set pose_tokens == total so every latent is pose-supervised
+    # and there is no separate context group.
     num_semantic_visual_pose_tokens: int = 8
     semantic_visual_hidden_dim: int = 768
     semantic_visual_num_heads: int = 8
@@ -436,10 +437,10 @@ class MolmoAct2Config(PreTrainedConfig):
                         "semantic_visual_recurrent requires mask_image_from_action_expert=true; "
                         "raw image KV must reach the AE only through the latent aggregator."
                     )
-                if not 1 <= self.num_semantic_visual_pose_tokens < self.num_semantic_visual_tokens:
+                if not 1 <= self.num_semantic_visual_pose_tokens <= self.num_semantic_visual_tokens:
                     raise ValueError(
                         "num_semantic_visual_pose_tokens must satisfy "
-                        "1 <= num_semantic_visual_pose_tokens < num_semantic_visual_tokens, got "
+                        "1 <= num_semantic_visual_pose_tokens <= num_semantic_visual_tokens, got "
                         f"{self.num_semantic_visual_pose_tokens} vs {self.num_semantic_visual_tokens}."
                     )
         elif (

@@ -1285,6 +1285,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
     def reset(self) -> None:
         self._action_queues = defaultdict(deque)
         self._rollout_action_generator = None
+        self._last_goal_pose_norm = None
 
     def _set_inference_cuda_graph_enabled(self, enabled: bool) -> None:
         if not hasattr(self, "model"):
@@ -1316,16 +1317,17 @@ class MolmoAct2Policy(PreTrainedPolicy):
     def _uses_policy_continuous_generation(self) -> bool:
         """Whether continuous inference must use the policy-owned prefill/denoise path.
 
-        Upstream ``generate_actions_from_inputs`` cannot inject v1 learnable goal tokens
-        or rebuild the v2/v2b semantic-visual latent KV context. RTC also requires this
-        path. Stage-1 SE(3) conditioning is intentionally excluded because closed-loop
-        inference has no future goal pose to encode.
+        Upstream ``generate_actions_from_inputs`` cannot inject goal tokens (learnable
+        queries or Stage-1 SE(3) encoder outputs) or rebuild the v2/v2b semantic-visual
+        latent KV context. RTC also requires this path. Stage-1 SE(3) probes must supply
+        ``batch['goal_pose']``; without it ``_goal_token_embeddings`` fails closed.
         """
-        uses_learned_goal_context = bool(
+        uses_goal_context = bool(
             getattr(self.config, "enable_goal_pose", False)
-            and getattr(self.config, "goal_token_source", None) == "learnable_queries"
+            and getattr(self.config, "goal_token_source", None)
+            in {"learnable_queries", "se3_encoder"}
         )
-        return self._rtc_enabled() or uses_learned_goal_context
+        return self._rtc_enabled() or uses_goal_context
 
     def _action_expert(self) -> torch.nn.Module:
         return self._backbone()._require_action_expert()
@@ -1393,10 +1395,10 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     getattr(self.config, "semantic_visual_num_layer_groups", 1)
                 ),
             ).to(dtype=model_dtype)
-            # Scheme-2a: only the first `num_semantic_visual_pose_tokens` latent tokens are
-            # supervised by L_pose, decoded via the v1-style concat head (all tokens still
-            # condition the action expert). Concatenating keeps geometry intact instead of
-            # collapsing the tokens through a single pooled vector.
+            # Soft bottleneck (v2b/v3): first `num_semantic_visual_pose_tokens` get L_pose
+            # via a concat readout; remaining latents are unsupervised context. Hard
+            # bottleneck (v4): pose_tokens == total → every latent is pose-supervised.
+            # In both cases all `num_semantic_visual_tokens` still condition the AE.
             # Unlike v1 goal tokens, these recurrent latents do not pass through the VLM's
             # final LayerNorm, so normalize each pose token before the concat readout.
             self.semantic_visual_pose_norm = torch.nn.LayerNorm(latent_dim).to(
@@ -2692,15 +2694,19 @@ class MolmoAct2Policy(PreTrainedPolicy):
         inference_delay: int | None,
         prev_chunk_left_over: Tensor | None,
         execution_horizon: int | None,
+        goal_batch: dict[str, Tensor] | None = None,
     ) -> Tensor:
         """Generate continuous actions with policy-owned context, optionally applying RTC.
 
         Despite the historical method name, this is also the required non-RTC path for
-        learned goal-token and semantic-visual conditioning.
+        learned goal-token, Stage-1 SE(3), and semantic-visual conditioning.
         """
         backbone = self._backbone()
         action_expert = self._action_expert()
-        outputs, num_goal_tokens = self._backbone_prefill_outputs(model_inputs)
+        outputs, num_goal_tokens = self._backbone_prefill_outputs(
+            model_inputs,
+            goal_batch=goal_batch,
+        )
         encoder_kv_states = backbone._extract_kv_states(outputs.past_key_values)
         encoder_attention_mask = self._encoder_attention_mask_for_action_expert(
             input_ids=model_inputs.get("input_ids"),
@@ -2807,12 +2813,20 @@ class MolmoAct2Policy(PreTrainedPolicy):
 
         return trajectory
 
-    def _backbone_prefill_outputs(self, model_inputs: dict[str, Tensor]) -> tuple[Any, int]:
-        """Run the VLM prefill, injecting goal tokens (Stage 2 uses learnable queries).
+    def _backbone_prefill_outputs(
+        self,
+        model_inputs: dict[str, Tensor],
+        *,
+        goal_batch: dict[str, Tensor] | None = None,
+    ) -> tuple[Any, int]:
+        """Run the VLM prefill, injecting goal tokens when enabled.
 
         Returns (outputs, num_goal_tokens). When goal-pose is disabled this is the plain
         backbone prefill. With goal-pose enabled, goal embeddings are appended at the
         embedding level (input_ids and inputs_embeds are mutually exclusive on the backbone).
+
+        ``goal_batch`` must carry ``goal_pose`` for ``goal_token_source='se3_encoder'``.
+        Learnable-query Stage 2 can pass ``None`` / ``{}``.
         """
         backbone = self._backbone()
         if self._uses_semantic_visual_conditioning():
@@ -2836,8 +2850,9 @@ class MolmoAct2Policy(PreTrainedPolicy):
         batch_size = int(input_ids.shape[0])
         device = input_ids.device
         dtype = next(self.model.parameters()).dtype
+        goal_source = goal_batch if goal_batch is not None else {}
         goal_embeds = self._goal_token_embeddings(
-            {}, batch_size=batch_size, device=device, dtype=dtype
+            goal_source, batch_size=batch_size, device=device, dtype=dtype
         )
 
         images = None
@@ -3104,7 +3119,8 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 if not getattr(self, "_logged_policy_continuous_generation", False):
                     logging.info(
                         "MolmoAct2 continuous inference using policy context path "
-                        "(goal_mode=%s, semantic_visual=%s, rtc=%s).",
+                        "(goal_source=%s, goal_mode=%s, semantic_visual=%s, rtc=%s).",
+                        getattr(self.config, "goal_token_source", None),
                         getattr(self.config, "goal_conditioning_mode", None),
                         self._uses_semantic_visual_conditioning(),
                         self._rtc_enabled(),
@@ -3118,6 +3134,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
                     inference_delay=kwargs.get("inference_delay"),
                     prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
                     execution_horizon=kwargs.get("execution_horizon"),
+                    goal_batch=batch,
                 )
             else:
                 actions = self._backbone().generate_actions_from_inputs(

@@ -96,10 +96,121 @@ from lerobot.utils.utils import (
 )
 
 
+def _goal_pose_quantiles(
+    policy: PreTrainedPolicy,
+    preprocessor: PolicyProcessorPipeline | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read the exact goal-pose q01/q99 used by the loaded policy processor."""
+    policy_config = getattr(policy, "config", None)
+    goal_key = str(getattr(policy_config, "goal_pose_feature_key", "observation.state"))
+    stats_candidates: list[Any] = []
+    if preprocessor is not None:
+        for step in getattr(preprocessor, "steps", []):
+            stats_candidates.append(getattr(step, "stats", None))
+    stats_candidates.append(getattr(policy_config, "dataset_stats", None))
+
+    for stats in stats_candidates:
+        if not isinstance(stats, dict) or not isinstance(stats.get(goal_key), dict):
+            continue
+        feature_stats = stats[goal_key]
+        q01_value = feature_stats.get("q01")
+        q99_value = feature_stats.get("q99")
+        if q01_value is None or q99_value is None:
+            continue
+        if torch.is_tensor(q01_value):
+            q01_value = q01_value.detach().cpu().numpy()
+        if torch.is_tensor(q99_value):
+            q99_value = q99_value.detach().cpu().numpy()
+        q01 = np.asarray(q01_value, dtype=np.float64).reshape(-1)
+        q99 = np.asarray(q99_value, dtype=np.float64).reshape(-1)
+        if (
+            q01.shape == q99.shape
+            and q01.size >= 6
+            and np.isfinite(q01).all()
+            and np.isfinite(q99).all()
+            and np.all(q99[:6] > q01[:6])
+        ):
+            return q01, q99
+
+    raise RuntimeError(
+        f"Cannot visualize normalized goal pose without saved q01/q99 stats for {goal_key!r}."
+    )
+
+
+def _pose_viz_task_prompt(env_i: Any) -> str:
+    """Best-effort language instruction from a LIBERO / LIBERO-PRO sub-env."""
+    for obj in (env_i, getattr(env_i, "_env", None), getattr(getattr(env_i, "_env", None), "env", None)):
+        if obj is None:
+            continue
+        for key in ("task_description", "language", "task"):
+            value = getattr(obj, key, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _draw_prompt_on_frame(
+    image: np.ndarray,
+    prompt: str,
+    *,
+    max_width_frac: float = 0.98,
+    font_scale: float = 0.42,
+) -> None:
+    """Draw a wrapped language prompt banner at the bottom of a camera frame."""
+    import cv2
+
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return
+
+    height, width = image.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 1
+    max_text_width = int(width * max_width_frac) - 16
+    words = prompt.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        (tw, _), _ = cv2.getTextSize(candidate, font, font_scale, thickness)
+        if tw <= max_text_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    if not lines:
+        return
+    # Cap to a few lines so the scene stays visible.
+    lines = lines[:3]
+    line_height = 18
+    pad_y = 8
+    banner_h = pad_y * 2 + line_height * len(lines)
+    y0 = max(0, height - banner_h)
+    overlay = image.copy()
+    cv2.rectangle(overlay, (0, y0), (width - 1, height - 1), (0, 0, 0), thickness=-1)
+    cv2.addWeighted(overlay, 0.62, image, 0.38, 0.0, dst=image)
+    for li, line in enumerate(lines):
+        cv2.putText(
+            image,
+            line,
+            (8, y0 + pad_y + line_height * (li + 1) - 4),
+            font,
+            font_scale,
+            (245, 245, 245),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
 def _maybe_overlay_goal_pose_frames(
     policy: PreTrainedPolicy,
     env: gym.vector.VectorEnv,
     frames: np.ndarray,
+    *,
+    preprocessor: PolicyProcessorPipeline | None = None,
 ) -> np.ndarray:
     """Overlay decoded MolmoAct2 goal poses onto rendered frames when possible.
 
@@ -107,11 +218,72 @@ def _maybe_overlay_goal_pose_frames(
     ``_last_goal_pose_norm`` via ``get_last_goal_pose_norm()``. Controlled by
     the ``POSE_VIZ_DIR`` environment variable in ``eval_policy``.
     """
-    pose = policy.get_last_goal_pose_norm() if hasattr(policy, "get_last_goal_pose_norm") else None
-    if pose is None:
-        return frames
+    import cv2
+
     if not isinstance(env, gym.vector.SyncVectorEnv):
         raise RuntimeError("POSE_VIZ overlay currently requires SyncVectorEnv")
+
+    batch_size, frame_height, frame_width = frames.shape[:3]
+    panel_width = max(300, int(round(frame_height * 0.9)))
+    out = np.full(
+        (batch_size, frame_height, frame_width + panel_width, 3),
+        18,
+        dtype=frames.dtype,
+    )
+    out[:, :, :frame_width] = frames
+    for batch_idx in range(batch_size):
+        panel = out[batch_idx, :, frame_width:]
+        cv2.putText(
+            panel,
+            "3D workspace (fixed view)",
+            (14, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (245, 245, 245),
+            1,
+            cv2.LINE_AA,
+        )
+        prompt = _pose_viz_task_prompt(env.envs[batch_idx]) if batch_idx < len(env.envs) else ""
+        if prompt:
+            # Compact prompt reminder on the side panel (first ~42 chars / wrap).
+            short = prompt if len(prompt) <= 42 else prompt[:39] + "..."
+            cv2.putText(
+                panel,
+                "prompt:",
+                (14, 48),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (180, 180, 180),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                panel,
+                short,
+                (14, 68),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (230, 230, 230),
+                1,
+                cv2.LINE_AA,
+            )
+
+    pose = policy.get_last_goal_pose_norm() if hasattr(policy, "get_last_goal_pose_norm") else None
+    if pose is None:
+        for batch_idx in range(batch_size):
+            prompt = _pose_viz_task_prompt(env.envs[batch_idx]) if batch_idx < len(env.envs) else ""
+            _draw_prompt_on_frame(out[batch_idx, :, :frame_width], prompt)
+            cv2.putText(
+                out[batch_idx, :, frame_width:],
+                "waiting for first chunk prediction",
+                (14, 92),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (160, 160, 160),
+                1,
+                cv2.LINE_AA,
+            )
+        return out
 
     from robosuite.utils.camera_utils import (
         get_camera_transform_matrix,
@@ -119,24 +291,334 @@ def _maybe_overlay_goal_pose_frames(
     )
 
     pose_np = pose.detach().float().cpu().numpy()
-    policy_config = getattr(policy, "config", None)
-    stats = getattr(policy_config, "dataset_stats", None)
-    goal_key = getattr(policy_config, "goal_pose_feature_key", "observation.state")
-    if isinstance(stats, dict) and goal_key in stats:
-        q01 = np.asarray(stats[goal_key].get("q01"), dtype=np.float64)
-        q99 = np.asarray(stats[goal_key].get("q99"), dtype=np.float64)
-        if q01 is not None and q99 is not None and np.asarray(q01).shape[-1] >= 3:
-            q01 = np.asarray(q01, dtype=np.float64)
-            q99 = np.asarray(q99, dtype=np.float64)
-            denom = np.maximum(q99[:3] - q01[:3], 1e-6)
-            xyz = (pose_np[..., :3] + 1.0) * denom / 2.0 + q01[:3]
-        else:
-            xyz = pose_np[..., :3]
-    else:
-        xyz = pose_np[..., :3]
+    if not np.isfinite(pose_np).all():
+        raise RuntimeError("Decoded goal pose contains non-finite values.")
+    q01, q99 = _goal_pose_quantiles(policy, preprocessor)
+    pose_world = pose_np.astype(np.float64, copy=True)
+    pose_world[..., :6] = (
+        (pose_np[..., :6] + 1.0) * (q99[:6] - q01[:6]) / 2.0 + q01[:6]
+    )
 
-    out = frames.copy()
-    n = min(out.shape[0], int(xyz.shape[0]), len(env.envs))
+    def project(
+        point: np.ndarray,
+        transform: np.ndarray,
+        height: int,
+        width: int,
+    ) -> tuple[int, int] | None:
+        pixels = project_points_from_world_to_camera(
+            np.asarray(point, dtype=np.float64).reshape(1, 3),
+            transform,
+            height,
+            width,
+        )[0]
+        row, col = int(pixels[0]), int(pixels[1])
+        row = height - 1 - row
+        col = width - 1 - col
+        if not (0 <= row < height and 0 <= col < width):
+            return None
+        return col, row
+
+    def rotation_matrix(axis_angle: np.ndarray) -> np.ndarray:
+        vector = np.asarray(axis_angle, dtype=np.float64).reshape(3)
+        angle = float(np.linalg.norm(vector))
+        if angle < 1e-8:
+            return np.eye(3, dtype=np.float64)
+        x, y, z = vector / angle
+        cross = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
+        return np.eye(3) + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
+
+    def draw_pose(
+        image: np.ndarray,
+        xyz: np.ndarray,
+        rotation: np.ndarray,
+        transform: np.ndarray,
+        *,
+        color: tuple[int, int, int],
+        label: str,
+    ) -> None:
+        height, width = image.shape[:2]
+        origin = project(xyz, transform, height, width)
+        if origin is None:
+            return
+        cv2.circle(image, origin, 8, (255, 255, 255), thickness=2, lineType=cv2.LINE_AA)
+        cv2.circle(image, origin, 6, color, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.putText(
+            image,
+            label,
+            (origin[0] + 9, max(14, origin[1] - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        for axis, axis_color in enumerate(((255, 50, 50), (50, 255, 50), (50, 100, 255))):
+            tip = project(
+                np.asarray(xyz, dtype=np.float64) + 0.05 * rotation[:, axis],
+                transform,
+                height,
+                width,
+            )
+            if tip is not None:
+                cv2.line(image, origin, tip, axis_color, 2, cv2.LINE_AA)
+
+    def draw_dashed_line(
+        image: np.ndarray,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        color: tuple[int, int, int],
+        *,
+        width: int = 1,
+        segments: int = 12,
+    ) -> None:
+        start_array = np.asarray(start, dtype=np.float64)
+        end_array = np.asarray(end, dtype=np.float64)
+        for segment in range(0, segments, 2):
+            alpha0 = segment / segments
+            alpha1 = min((segment + 1) / segments, 1.0)
+            point0 = tuple(np.rint(start_array * (1.0 - alpha0) + end_array * alpha0).astype(int))
+            point1 = tuple(np.rint(start_array * (1.0 - alpha1) + end_array * alpha1).astype(int))
+            cv2.line(image, point0, point1, color, width, cv2.LINE_AA)
+
+    def draw_3d_workspace(
+        panel: np.ndarray,
+        current_xyz: np.ndarray,
+        current_rotation: np.ndarray,
+        predicted_xyz: np.ndarray,
+        predicted_rotation: np.ndarray,
+    ) -> None:
+        height, width = panel.shape[:2]
+        lower = q01[:3].astype(np.float64)
+        upper = q99[:3].astype(np.float64)
+        margin = np.maximum((upper - lower) * 0.04, 1e-3)
+        lower -= margin
+        upper += margin
+        center = (lower + upper) / 2.0
+
+        azimuth = np.deg2rad(-55.0)
+        elevation = np.deg2rad(25.0)
+        view = np.array(
+            [
+                np.cos(elevation) * np.cos(azimuth),
+                np.cos(elevation) * np.sin(azimuth),
+                np.sin(elevation),
+            ]
+        )
+        right = np.array([-np.sin(azimuth), np.cos(azimuth), 0.0])
+        up = np.cross(view, right)
+
+        corners = np.array(
+            [
+                [x, y, z]
+                for x in (lower[0], upper[0])
+                for y in (lower[1], upper[1])
+                for z in (lower[2], upper[2])
+            ],
+            dtype=np.float64,
+        )
+        projected_corners = np.stack(
+            ((corners - center) @ right, (corners - center) @ up),
+            axis=-1,
+        )
+        projection_min = projected_corners.min(axis=0)
+        projection_max = projected_corners.max(axis=0)
+        projection_span = np.maximum(projection_max - projection_min, 1e-6)
+        draw_left, draw_right = 18, width - 18
+        draw_top, draw_bottom = 45, height - 78
+
+        def project_3d(point: np.ndarray) -> tuple[int, int]:
+            relative = np.asarray(point, dtype=np.float64) - center
+            projected = np.array([relative @ right, relative @ up])
+            normalized = np.clip(
+                (projected - projection_min) / projection_span,
+                0.0,
+                1.0,
+            )
+            x = int(round(draw_left + normalized[0] * (draw_right - draw_left)))
+            y = int(round(draw_bottom - normalized[1] * (draw_bottom - draw_top)))
+            return x, y
+
+        floor_color = (58, 58, 58)
+        box_color = (88, 88, 88)
+        for fraction in np.linspace(0.0, 1.0, 6):
+            x = lower[0] + fraction * (upper[0] - lower[0])
+            y = lower[1] + fraction * (upper[1] - lower[1])
+            cv2.line(
+                panel,
+                project_3d(np.array([x, lower[1], lower[2]])),
+                project_3d(np.array([x, upper[1], lower[2]])),
+                floor_color,
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.line(
+                panel,
+                project_3d(np.array([lower[0], y, lower[2]])),
+                project_3d(np.array([upper[0], y, lower[2]])),
+                floor_color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        corner_lookup = {
+            (x_index, y_index, z_index): np.array([x, y, z])
+            for x_index, x in enumerate((lower[0], upper[0]))
+            for y_index, y in enumerate((lower[1], upper[1]))
+            for z_index, z in enumerate((lower[2], upper[2]))
+        }
+        for x_index in range(2):
+            for y_index in range(2):
+                cv2.line(
+                    panel,
+                    project_3d(corner_lookup[(x_index, y_index, 0)]),
+                    project_3d(corner_lookup[(x_index, y_index, 1)]),
+                    box_color,
+                    1,
+                    cv2.LINE_AA,
+                )
+        for z_index in range(2):
+            for fixed_axis in range(2):
+                for fixed_value in range(2):
+                    start_index = [0, 0, z_index]
+                    end_index = [0, 0, z_index]
+                    start_index[fixed_axis] = fixed_value
+                    end_index[fixed_axis] = fixed_value
+                    varying_axis = 1 - fixed_axis
+                    start_index[varying_axis] = 0
+                    end_index[varying_axis] = 1
+                    cv2.line(
+                        panel,
+                        project_3d(corner_lookup[tuple(start_index)]),
+                        project_3d(corner_lookup[tuple(end_index)]),
+                        box_color,
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+        axis_origin = lower.copy()
+        axis_lengths = np.maximum((upper - lower) * 0.18, 0.035)
+        for axis, (axis_name, axis_color) in enumerate(
+            (("X", (255, 60, 60)), ("Y", (60, 255, 60)), ("Z", (60, 120, 255)))
+        ):
+            endpoint = axis_origin.copy()
+            endpoint[axis] += axis_lengths[axis]
+            start_pixel = project_3d(axis_origin)
+            endpoint_pixel = project_3d(endpoint)
+            cv2.arrowedLine(
+                panel,
+                start_pixel,
+                endpoint_pixel,
+                axis_color,
+                2,
+                cv2.LINE_AA,
+                tipLength=0.18,
+            )
+            cv2.putText(
+                panel,
+                axis_name,
+                (endpoint_pixel[0] + 3, endpoint_pixel[1] - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                axis_color,
+                1,
+                cv2.LINE_AA,
+            )
+
+        for xyz, color in (
+            (current_xyz, (40, 110, 255)),
+            (predicted_xyz, (255, 40, 40)),
+        ):
+            floor_point = np.array([xyz[0], xyz[1], lower[2]])
+            draw_dashed_line(
+                panel,
+                project_3d(floor_point),
+                project_3d(xyz),
+                color,
+                width=1,
+            )
+
+        current_pixel = project_3d(current_xyz)
+        predicted_pixel = project_3d(predicted_xyz)
+        cv2.arrowedLine(
+            panel,
+            current_pixel,
+            predicted_pixel,
+            (210, 210, 210),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.1,
+        )
+
+        def draw_3d_pose(
+            xyz: np.ndarray,
+            rotation: np.ndarray,
+            *,
+            color: tuple[int, int, int],
+            label: str,
+        ) -> None:
+            origin_pixel = project_3d(xyz)
+            cv2.circle(panel, origin_pixel, 8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(panel, origin_pixel, 6, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                panel,
+                label,
+                (origin_pixel[0] + 10, max(48, origin_pixel[1] - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            for axis, axis_color in enumerate(
+                ((255, 60, 60), (60, 255, 60), (60, 120, 255))
+            ):
+                endpoint = np.asarray(xyz) + 0.055 * rotation[:, axis]
+                cv2.arrowedLine(
+                    panel,
+                    origin_pixel,
+                    project_3d(endpoint),
+                    axis_color,
+                    2,
+                    cv2.LINE_AA,
+                    tipLength=0.16,
+                )
+
+        draw_3d_pose(
+            current_xyz,
+            current_rotation,
+            color=(40, 110, 255),
+            label="cur",
+        )
+        draw_3d_pose(
+            predicted_xyz,
+            predicted_rotation,
+            color=(255, 40, 40),
+            label="pred@t+10",
+        )
+
+        position_error_cm = float(np.linalg.norm(predicted_xyz - current_xyz) * 100.0)
+        cv2.putText(
+            panel,
+            f"cur -> pred: {position_error_cm:.1f} cm",
+            (14, height - 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (230, 230, 230),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            "blue=current   red=predicted chunk endpoint",
+            (14, height - 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (190, 190, 190),
+            1,
+            cv2.LINE_AA,
+        )
+
+    n = min(batch_size, int(pose_world.shape[0]), len(env.envs))
     for i in range(n):
         sub = env.envs[i]
         inner = getattr(sub, "_env", None)
@@ -145,18 +627,53 @@ def _maybe_overlay_goal_pose_frames(
         sim = getattr(getattr(inner, "env", None), "sim", None) or getattr(inner, "sim", None)
         if sim is None:
             continue
-        h, w = out[i].shape[:2]
-        transform = get_camera_transform_matrix(sim, "agentview", h, w)
-        pixels = project_points_from_world_to_camera(
-            np.asarray(xyz[i], dtype=np.float64).reshape(1, 3), transform, h, w
-        )[0]
-        row, col = int(pixels[0]), int(pixels[1])
-        row = h - 1 - row
-        col = w - 1 - col
-        if 0 <= row < h and 0 <= col < w:
-            rr = slice(max(0, row - 3), min(h, row + 4))
-            cc = slice(max(0, col - 3), min(w, col + 4))
-            out[i, rr, cc] = np.array([255, 40, 40], dtype=out.dtype)
+        camera_frame = out[i, :, :frame_width]
+        transform = get_camera_transform_matrix(
+            sim,
+            "agentview",
+            frame_height,
+            frame_width,
+        )
+        raw_obs = inner.env._get_observations()
+        current_xyz = np.asarray(raw_obs["robot0_eef_pos"], dtype=np.float64)
+        current_rotation = np.asarray(inner.robots[0].controller.ee_ori_mat, dtype=np.float64)
+        predicted_rotation = rotation_matrix(pose_world[i, 3:6])
+        draw_pose(
+            camera_frame,
+            current_xyz,
+            current_rotation,
+            transform,
+            color=(40, 110, 255),
+            label="cur",
+        )
+        draw_pose(
+            camera_frame,
+            pose_world[i, :3],
+            predicted_rotation,
+            transform,
+            color=(255, 40, 40),
+            label="pred",
+        )
+        text = "pred xyz=({:.3f}, {:.3f}, {:.3f})".format(*pose_world[i, :3])
+        cv2.rectangle(camera_frame, (4, 4), (280, 25), (0, 0, 0), thickness=-1)
+        cv2.putText(
+            camera_frame,
+            text,
+            (8, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        _draw_prompt_on_frame(camera_frame, _pose_viz_task_prompt(sub))
+        draw_3d_workspace(
+            out[i, :, frame_width:],
+            current_xyz,
+            current_rotation,
+            pose_world[i, :3],
+            predicted_rotation,
+        )
     return out
 
 
@@ -422,7 +939,12 @@ def eval_policy(
         pose_viz_dir = os.environ.get("POSE_VIZ_DIR", "").strip()
         if pose_viz_dir and hasattr(policy, "get_last_goal_pose_norm"):
             try:
-                frames_now = _maybe_overlay_goal_pose_frames(policy, env, frames_now)
+                frames_now = _maybe_overlay_goal_pose_frames(
+                    policy,
+                    env,
+                    frames_now,
+                    preprocessor=preprocessor,
+                )
             except Exception as exc:  # noqa: BLE001
                 if not getattr(render_frame, "_pose_viz_warned", False):
                     logging.warning("POSE_VIZ overlay skipped: %s", exc)

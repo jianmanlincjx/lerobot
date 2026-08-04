@@ -742,6 +742,27 @@ class LiberoPlusEnv(LiberoEnv):
     is_libero_plus: bool = True
 
 
+@EnvConfig.register_subclass("libero_pro")
+@dataclass
+class LiberoProEnv(LiberoEnv):
+    """Config for LIBERO-PRO generalization evaluation.
+
+    LIBERO-PRO registers perturbed suites such as ``libero_spatial_object`` /
+    ``libero_10_task``. The gym / init-state layout matches vanilla LIBERO
+    (``init_files/<suite>/<task>.pruned_init``), so this config keeps
+    ``is_libero_plus=False`` and must not reuse Plus ``libero_newobj`` logic.
+
+    Point ``PYTHONPATH`` at the PRO checkout and ``LIBERO_CONFIG_PATH`` at the
+    isolated config under ``/data0/JM/benchmarks/libero_pro/libero_config``.
+
+    See Also:
+        https://github.com/Zxy-MLlab/LIBERO-PRO
+    """
+
+    task: str = "libero_spatial_object"
+    is_libero_plus: bool = False
+
+
 @EnvConfig.register_subclass("robotwin")
 @dataclass
 class RoboTwinEnvConfig(EnvConfig):

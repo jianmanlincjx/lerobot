@@ -115,6 +115,21 @@ TASK_SUITE_MAX_STEPS: dict[str, int] = {
 }
 
 
+def max_steps_for_suite(task_suite_name: str, default_steps: int = 300) -> int:
+    """Resolve horizon for vanilla, Plus, and PRO suite names.
+
+    LIBERO-PRO registers suites like ``libero_spatial_object`` / ``libero_10_task``.
+    Fall back to the matching base suite horizon rather than the global default.
+    """
+    if task_suite_name in TASK_SUITE_MAX_STEPS:
+        return TASK_SUITE_MAX_STEPS[task_suite_name]
+    # Prefer longer base names first (libero_10 before libero_1… if ever added).
+    for base in sorted(TASK_SUITE_MAX_STEPS, key=len, reverse=True):
+        if task_suite_name.startswith(f"{base}_"):
+            return TASK_SUITE_MAX_STEPS[base]
+    return default_steps
+
+
 class LiberoEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 80}
 
@@ -190,7 +205,7 @@ class LiberoEnv(gym.Env):
 
         default_steps = 500
         self._max_episode_steps = (
-            TASK_SUITE_MAX_STEPS.get(task_suite_name, default_steps)
+            max_steps_for_suite(task_suite_name, default_steps)
             if self.episode_length is None
             else self.episode_length
         )

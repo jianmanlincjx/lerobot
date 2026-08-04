@@ -269,8 +269,9 @@ def test_semantic_visual_config_validation_and_scheduler_group():
             mask_image_from_action_expert=False,
         )
 
-    # num_semantic_visual_pose_tokens must be in [1, num_semantic_visual_tokens).
-    for bad_pose_tokens in (0, 100):
+    # Soft bottleneck: pose in [1, total). Hard bottleneck (v4): pose == total is allowed.
+    # Illegal: pose < 1 or pose > total.
+    for bad_pose_tokens in (0, 101):
         with pytest.raises(ValueError):
             MolmoAct2Config(
                 checkpoint_path="/tmp/x",
@@ -284,6 +285,33 @@ def test_semantic_visual_config_validation_and_scheduler_group():
                 num_semantic_visual_tokens=100,
                 num_semantic_visual_pose_tokens=bad_pose_tokens,
             )
+
+    # v3-style soft bottleneck still valid
+    MolmoAct2Config(
+        checkpoint_path="/tmp/x",
+        action_mode="continuous",
+        enable_goal_pose=True,
+        goal_token_source="learnable_queries",
+        goal_conditioning_mode="semantic_visual_recurrent",
+        target_pose_delta_index=10,
+        enable_pose_reconstruction=True,
+        mask_image_from_action_expert=True,
+        num_semantic_visual_tokens=100,
+        num_semantic_visual_pose_tokens=8,
+    )
+    # v4-style hard bottleneck: pose_tokens == total
+    MolmoAct2Config(
+        checkpoint_path="/tmp/x",
+        action_mode="continuous",
+        enable_goal_pose=True,
+        goal_token_source="learnable_queries",
+        goal_conditioning_mode="semantic_visual_recurrent",
+        target_pose_delta_index=10,
+        enable_pose_reconstruction=True,
+        mask_image_from_action_expert=True,
+        num_semantic_visual_tokens=8,
+        num_semantic_visual_pose_tokens=8,
+    )
 
     with pytest.raises(ValueError):
         MolmoAct2Config(
