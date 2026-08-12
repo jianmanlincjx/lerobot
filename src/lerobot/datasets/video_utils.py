@@ -17,6 +17,7 @@ import contextlib
 import glob
 import importlib
 import logging
+import os
 import queue
 import shutil
 import tempfile
@@ -235,7 +236,22 @@ def decode_video_frames_pyav(
 
     with av.open(video_path) as container:
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
+        # "AUTO" lets FFmpeg size a frame-thread pool from the *machine's* core
+        # count, ignoring any cgroup/PBS allocation. That pool is created and
+        # torn down on every call (this function reopens the container for each
+        # frame request), so for the small frames used here (e.g. 180x320) the
+        # thread setup dominates the actual decode: measured 26.4ms/frame with
+        # "AUTO" vs 5.4ms single-threaded, uncontended -- and it degrades far
+        # worse under a DataLoader, where dozens of worker processes each spawn
+        # their own oversized pool and thrash the CPUs. Decoding single-threaded
+        # is both faster per call and leaves parallelism to the workers, which
+        # is where it actually scales. Output is bit-identical either way.
+        thread_count = int(os.environ.get("LEROBOT_PYAV_THREADS", "1"))
+        if thread_count == 0:
+            stream.thread_type = "AUTO"
+        else:
+            stream.codec_context.thread_type = "NONE"
+            stream.codec_context.thread_count = thread_count
 
         # With a stream argument PyAV expects offsets in that stream's time-base,
         # not AV_TIME_BASE units. Using microseconds here can seek hundreds of

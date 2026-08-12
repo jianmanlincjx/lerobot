@@ -117,6 +117,10 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 video_backend=cfg.dataset.video_backend,
                 return_uint8=True,
                 tolerance_s=cfg.tolerance_s,
+                # Policies that ignore visual input entirely (e.g. MolmoAct2
+                # Stage1's vision-free action prior) shouldn't pay for video
+                # decoding just to discard the frames afterward.
+                skip_video_decode=getattr(cfg.policy, "disable_visual_input", False),
             )
         else:
             if cfg.dataset.sample_indices_path is not None:

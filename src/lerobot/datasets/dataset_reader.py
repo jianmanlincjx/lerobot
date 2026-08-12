@@ -65,6 +65,7 @@ class DatasetReader:
         image_transforms: Callable | None,
         return_uint8: bool = False,
         sample_indices_path: str | Path | None = None,
+        skip_video_decode: bool = False,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -90,6 +91,7 @@ class DatasetReader:
         self._video_backend = video_backend
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
+        self._skip_video_decode = skip_video_decode
         self.sample_indices_path = Path(sample_indices_path).expanduser() if sample_indices_path else None
 
         self.hf_dataset: datasets.Dataset | None = None
@@ -473,7 +475,7 @@ class DatasetReader:
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self._meta.video_keys) > 0:
+        if len(self._meta.video_keys) > 0 and not self._skip_video_decode:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)

@@ -63,6 +63,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
         sample_indices_path: str | Path | None = None,
+        skip_video_decode: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -212,6 +213,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._batch_encoding_size = batch_encoding_size
         self._vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
+        self._skip_video_decode = skip_video_decode
 
         if self._requested_root is not None:
             self._requested_root.mkdir(exist_ok=True, parents=True)
@@ -234,6 +236,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             image_transforms=image_transforms,
             return_uint8=self._return_uint8,
             sample_indices_path=self.sample_indices_path,
+            skip_video_decode=self._skip_video_decode,
         )
 
         # Load actual data
@@ -299,6 +302,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 image_transforms=self.image_transforms,
                 return_uint8=self._return_uint8,
                 sample_indices_path=self.sample_indices_path,
+                skip_video_decode=self._skip_video_decode,
             )
         return self.reader
 
