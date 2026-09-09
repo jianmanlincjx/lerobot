@@ -179,6 +179,9 @@ class MolmoAct2Config(PreTrainedConfig):
     goal_pose_feature_key: str = OBS_STATE
     mask_image_from_action_expert: bool = False
     enable_pose_reconstruction: bool = False
+    # Ablation A1: regress the chunk-end pose from pooled action-expert hidden states,
+    # with the backbone architecture otherwise untouched (no latents, no firewall).
+    enable_ae_pose_head: bool = False
     pose_recon_loss_weight: float = 1.0
     init_queries_from_se3_encoder: bool = False
     optimizer_goal_lr: float = 5e-5
@@ -404,6 +407,13 @@ class MolmoAct2Config(PreTrainedConfig):
                 "semantic_visual_num_layer_groups must be >= 1, "
                 f"got {self.semantic_visual_num_layer_groups}."
             )
+        if self.enable_ae_pose_head and (
+            self.target_pose_delta_index is None or self.target_pose_delta_index < 1
+        ):
+            raise ValueError(
+                "enable_ae_pose_head=true requires target_pose_delta_index >= 1 "
+                "(A1 requires target_pose_delta_index to load the chunk-end pose)."
+            )
         if self.enable_goal_pose:
             if self.num_goal_tokens < 1:
                 raise ValueError(f"num_goal_tokens must be >= 1, got {self.num_goal_tokens}.")
@@ -433,10 +443,16 @@ class MolmoAct2Config(PreTrainedConfig):
                 if self.disable_visual_input:
                     raise ValueError("semantic_visual_recurrent requires visual input.")
                 if not self.mask_image_from_action_expert:
-                    raise ValueError(
-                        "semantic_visual_recurrent requires mask_image_from_action_expert=true; "
-                        "raw image KV must reach the AE only through the latent aggregator."
-                    )
+                    # Ablation escape hatch (arm "open visual path"): keep the latent
+                    # interface + pose supervision but let raw image KV reach the AE too.
+                    # Default behaviour is unchanged; opt in via LIT_ALLOW_OPEN_VISUAL_PATH=1.
+                    import os as _os
+                    if _os.environ.get("LIT_ALLOW_OPEN_VISUAL_PATH") != "1":
+                        raise ValueError(
+                            "semantic_visual_recurrent requires mask_image_from_action_expert=true; "
+                            "raw image KV must reach the AE only through the latent aggregator. "
+                            "(Set LIT_ALLOW_OPEN_VISUAL_PATH=1 only for the open-visual-path ablation.)"
+                        )
                 if not 1 <= self.num_semantic_visual_pose_tokens <= self.num_semantic_visual_tokens:
                     raise ValueError(
                         "num_semantic_visual_pose_tokens must satisfy "

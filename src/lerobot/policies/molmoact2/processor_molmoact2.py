@@ -487,6 +487,7 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
     image_keys: list[str] = field(default_factory=list)
     disable_visual_input: bool = False
     enable_goal_pose: bool = False
+    enable_ae_pose_head: bool = False
     goal_pose_feature_key: str = OBS_STATE
     setup_type: str = ""
     control_mode: str = ""
@@ -813,7 +814,7 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
         if action_horizon_is_pad is not None:
             complementary["action_horizon_is_pad"] = action_horizon_is_pad
 
-        if self.enable_goal_pose:
+        if self.enable_goal_pose or self.enable_ae_pose_head:
             goal_pose, goal_pose_is_pad = self._extract_goal_pose(observation, complementary, batch_size)
             if goal_pose is not None:
                 complementary["goal_pose"] = goal_pose
@@ -901,6 +902,7 @@ def make_molmoact2_pre_post_processors(
             image_keys=image_keys,
             disable_visual_input=config.disable_visual_input,
             enable_goal_pose=config.enable_goal_pose,
+            enable_ae_pose_head=getattr(config, "enable_ae_pose_head", False),
             goal_pose_feature_key=config.goal_pose_feature_key,
             setup_type=setup_type,
             control_mode=control_mode,

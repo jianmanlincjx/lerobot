@@ -1267,6 +1267,15 @@ class MolmoAct2Policy(PreTrainedPolicy):
         if self.config.enable_goal_pose:
             self._build_goal_pose_modules(model_dtype)
 
+        if bool(getattr(self.config, "enable_ae_pose_head", False)):
+            # Ablation A1: architecture untouched; a pose head reads pooled action-expert
+            # hidden states. Same MLP shape as the LIT pose decoder (num_tokens=1) so the
+            # two heads have identical capacity.
+            ae_dim = int(self._action_expert().action_embed.out_features)
+            self.action_expert_pose_head = _GoalPoseDecoder(
+                1, ae_dim, self._goal_pose_dim(), int(self.config.goal_hidden_dim)
+            ).to(dtype=model_dtype)
+
         if self.config.freeze_embedding:
             self._freeze_input_embeddings()
         if self.config.train_action_expert_only:
@@ -2358,6 +2367,12 @@ class MolmoAct2Policy(PreTrainedPolicy):
         if reduction == "mean":
             loss = loss.mean()
         pose_conditioning = semantic_tokens if use_semantic_visual else hidden_states
+        if bool(getattr(self.config, "enable_ae_pose_head", False)):
+            # [B*T, chunk, d] -> mean over chunk positions, then over flow timesteps -> [B, d]
+            pooled = action_hidden.reshape(
+                batch_size, num_flow_timesteps, action_hidden.shape[1], action_hidden.shape[2]
+            ).mean(dim=(1, 2))
+            self._last_action_expert_pooled = pooled
         return loss, pose_conditioning
 
     def _discrete_token_weights(self, valid_positions: Tensor) -> Tensor | None:
@@ -2978,6 +2993,28 @@ class MolmoAct2Policy(PreTrainedPolicy):
         pose = getattr(self, "_last_goal_pose_norm", None)
         return pose if isinstance(pose, Tensor) else None
 
+    def _compute_action_expert_pose_head_loss(self, batch: dict[str, Tensor]) -> Tensor | None:
+        """Ablation A1: regress the chunk-end pose from pooled action-expert hidden states.
+
+        Same loss form as L_pose (MSE in normalized pose space, padding-masked); the only
+        difference is where the prediction comes from -- the action expert itself rather
+        than a pose-supervised latent interface.
+        """
+        if not bool(getattr(self.config, "enable_ae_pose_head", False)):
+            return None
+        pooled = getattr(self, "_last_action_expert_pooled", None)
+        goal_pose = batch.get("goal_pose")
+        if pooled is None or goal_pose is None:
+            return None
+        pred = self.action_expert_pose_head(pooled.unsqueeze(1)).float()
+        target = goal_pose.to(device=pred.device, dtype=pred.dtype)
+        per_sample = F.mse_loss(pred, target, reduction="none").mean(dim=-1)
+        is_pad = batch.get("goal_pose_is_pad")
+        if is_pad is not None:
+            valid = (~is_pad.to(device=per_sample.device, dtype=torch.bool)).to(per_sample.dtype)
+            return (per_sample * valid).sum() / valid.sum().clamp_min(1.0)
+        return per_sample.mean()
+
     def _compute_pose_reconstruction_loss(
         self, batch: dict[str, Tensor], hidden_states: Tensor
     ) -> Tensor | None:
@@ -3056,6 +3093,10 @@ class MolmoAct2Policy(PreTrainedPolicy):
             if pose_loss is not None:
                 losses.append(self.config.pose_recon_loss_weight * pose_loss)
                 metrics["pose_recon_loss"] = pose_loss.detach().float().mean().item()
+            ae_pose_loss = self._compute_action_expert_pose_head_loss(batch)
+            if ae_pose_loss is not None:
+                losses.append(self.config.pose_recon_loss_weight * ae_pose_loss)
+                metrics["ae_pose_head_loss"] = ae_pose_loss.detach().float().mean().item()
 
         else:
             flow_loss, hidden_states = self._compute_flow_matching_loss_joint_per_layer(

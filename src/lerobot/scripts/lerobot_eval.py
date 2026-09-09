@@ -53,6 +53,7 @@ import concurrent.futures as cf
 import json
 import logging
 import os
+import pathlib
 import threading
 import time
 from collections import defaultdict
@@ -205,6 +206,33 @@ def _draw_prompt_on_frame(
         )
 
 
+# Per-episode trace behind the goal-pose figure: where the arm actually went, and where the
+# decoded pose tokens said it should go. Written whenever POSE_TRAJ_DIR is set, alongside the
+# camera matrix and a clean first frame, so the figure can be drawn offline without re-running
+# the policy. Keyed by env index; one file per env, rewritten in place as the episode advances.
+_POSE_TRAJ: dict[int, dict] = {}
+
+
+def _dump_pose_traj(env_index: int, out_dir: str) -> None:
+    import numpy as np
+
+    rec = _POSE_TRAJ.get(env_index)
+    if not rec or not rec["cur"]:
+        return
+    d = pathlib.Path(out_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        d / f"traj_env{env_index}.npz",
+        cur=np.asarray(rec["cur"], dtype=np.float64),
+        pred=np.asarray(rec["pred"], dtype=np.float64),
+        transform=np.asarray(rec["transform"], dtype=np.float64),
+        first_frame=rec["first_frame"],
+        init_state=rec.get("init_state", np.zeros(0)),
+        states=np.asarray(rec.get("states", []), dtype=np.float64),
+        bddl=np.array(rec.get("bddl", "")),
+    )
+
+
 def _maybe_overlay_goal_pose_frames(
     policy: PreTrainedPolicy,
     env: gym.vector.VectorEnv,
@@ -224,13 +252,14 @@ def _maybe_overlay_goal_pose_frames(
         raise RuntimeError("POSE_VIZ overlay currently requires SyncVectorEnv")
 
     batch_size, frame_height, frame_width = frames.shape[:3]
-    panel_width = max(300, int(round(frame_height * 0.9)))
+    panel_width = max(340, int(round(frame_height * 1.05)))
     out = np.full(
         (batch_size, frame_height, frame_width + panel_width, 3),
         18,
         dtype=frames.dtype,
     )
     out[:, :, :frame_width] = frames
+    clean_frames = frames.copy()
     for batch_idx in range(batch_size):
         panel = out[batch_idx, :, frame_width:]
         cv2.putText(
@@ -243,61 +272,28 @@ def _maybe_overlay_goal_pose_frames(
             1,
             cv2.LINE_AA,
         )
-        prompt = _pose_viz_task_prompt(env.envs[batch_idx]) if batch_idx < len(env.envs) else ""
-        if prompt:
-            # Compact prompt reminder on the side panel (first ~42 chars / wrap).
-            short = prompt if len(prompt) <= 42 else prompt[:39] + "..."
-            cv2.putText(
-                panel,
-                "prompt:",
-                (14, 48),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (180, 180, 180),
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                panel,
-                short,
-                (14, 68),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.38,
-                (230, 230, 230),
-                1,
-                cv2.LINE_AA,
-            )
 
     pose = policy.get_last_goal_pose_norm() if hasattr(policy, "get_last_goal_pose_norm") else None
-    if pose is None:
-        for batch_idx in range(batch_size):
-            prompt = _pose_viz_task_prompt(env.envs[batch_idx]) if batch_idx < len(env.envs) else ""
-            _draw_prompt_on_frame(out[batch_idx, :, :frame_width], prompt)
-            cv2.putText(
-                out[batch_idx, :, frame_width:],
-                "waiting for first chunk prediction",
-                (14, 92),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.42,
-                (160, 160, 160),
-                1,
-                cv2.LINE_AA,
-            )
-        return out
-
     from robosuite.utils.camera_utils import (
         get_camera_transform_matrix,
         project_points_from_world_to_camera,
     )
 
-    pose_np = pose.detach().float().cpu().numpy()
-    if not np.isfinite(pose_np).all():
-        raise RuntimeError("Decoded goal pose contains non-finite values.")
-    q01, q99 = _goal_pose_quantiles(policy, preprocessor)
-    pose_world = pose_np.astype(np.float64, copy=True)
-    pose_world[..., :6] = (
-        (pose_np[..., :6] + 1.0) * (q99[:6] - q01[:6]) / 2.0 + q01[:6]
-    )
+    pose_world = None
+    if pose is not None:
+        pose_np = pose.detach().float().cpu().numpy()
+        if not np.isfinite(pose_np).all():
+            raise RuntimeError("Decoded goal pose contains non-finite values.")
+        pose_world = pose_np.astype(np.float64, copy=True)
+    try:
+        q01, q99 = _goal_pose_quantiles(policy, preprocessor)
+    except RuntimeError:
+        q01 = np.array([-0.5, -0.5, 0.0, -1.0, -1.0, -1.0], dtype=np.float64)
+        q99 = np.array([0.5, 0.5, 0.55, 1.0, 1.0, 1.0], dtype=np.float64)
+    if pose_world is not None:
+        pose_world[..., :6] = (
+            (pose_world[..., :6] + 1.0) * (q99[:6] - q01[:6]) / 2.0 + q01[:6]
+        )
 
     def project(
         point: np.ndarray,
@@ -327,6 +323,54 @@ def _maybe_overlay_goal_pose_frames(
         cross = np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
         return np.eye(3) + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
 
+    def draw_outlined_text(
+        image: np.ndarray,
+        text: str,
+        origin: tuple[int, int],
+        color: tuple[int, int, int],
+        *,
+        font_scale: float = 0.58,
+        thickness: int = 2,
+    ) -> None:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(image, text, origin, font, font_scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+        cv2.putText(image, text, origin, font, font_scale, color, thickness, cv2.LINE_AA)
+
+    # Frames are RGB (write_video / gym render). OpenCV draws into that buffer
+    # without converting, so these tuples must be RGB, not BGR.
+    cur_rgb = (0, 220, 255)
+    pred_rgb = (255, 36, 36)
+    link_rgb = (255, 220, 0)
+    axis_rgb = ((255, 48, 48), (36, 220, 64), (48, 96, 255))
+
+    def draw_marker(
+        image: np.ndarray,
+        origin: tuple[int, int],
+        color: tuple[int, int, int],
+        marker: str,
+    ) -> None:
+        if marker == "square":
+            half = 10
+            cv2.rectangle(
+                image,
+                (origin[0] - half - 3, origin[1] - half - 3),
+                (origin[0] + half + 3, origin[1] + half + 3),
+                (255, 255, 255),
+                thickness=-1,
+                lineType=cv2.LINE_AA,
+            )
+            cv2.rectangle(
+                image,
+                (origin[0] - half, origin[1] - half),
+                (origin[0] + half, origin[1] + half),
+                color,
+                thickness=-1,
+                lineType=cv2.LINE_AA,
+            )
+            return
+        cv2.circle(image, origin, 14, (255, 255, 255), thickness=4, lineType=cv2.LINE_AA)
+        cv2.circle(image, origin, 10, color, thickness=-1, lineType=cv2.LINE_AA)
+
     def draw_pose(
         image: np.ndarray,
         xyz: np.ndarray,
@@ -335,32 +379,35 @@ def _maybe_overlay_goal_pose_frames(
         *,
         color: tuple[int, int, int],
         label: str,
-    ) -> None:
+        marker: str = "circle",
+        axis_length: float = 0.08,
+        draw_axes: bool = True,
+        label_offset: tuple[int, int] = (14, -12),
+    ) -> tuple[int, int] | None:
         height, width = image.shape[:2]
         origin = project(xyz, transform, height, width)
         if origin is None:
-            return
-        cv2.circle(image, origin, 8, (255, 255, 255), thickness=2, lineType=cv2.LINE_AA)
-        cv2.circle(image, origin, 6, color, thickness=-1, lineType=cv2.LINE_AA)
-        cv2.putText(
+            return None
+        if draw_axes:
+            for axis, axis_color in enumerate(axis_rgb):
+                tip = project(
+                    np.asarray(xyz, dtype=np.float64) + axis_length * rotation[:, axis],
+                    transform,
+                    height,
+                    width,
+                )
+                if tip is not None:
+                    cv2.line(image, origin, tip, (0, 0, 0), 7, cv2.LINE_AA)
+                    cv2.line(image, origin, tip, color, 5, cv2.LINE_AA)
+                    cv2.line(image, origin, tip, axis_color, 3, cv2.LINE_AA)
+        draw_marker(image, origin, color, marker)
+        draw_outlined_text(
             image,
             label,
-            (origin[0] + 9, max(14, origin[1] - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            (origin[0] + label_offset[0], max(22, origin[1] + label_offset[1])),
             color,
-            1,
-            cv2.LINE_AA,
         )
-        for axis, axis_color in enumerate(((255, 50, 50), (50, 255, 50), (50, 100, 255))):
-            tip = project(
-                np.asarray(xyz, dtype=np.float64) + 0.05 * rotation[:, axis],
-                transform,
-                height,
-                width,
-            )
-            if tip is not None:
-                cv2.line(image, origin, tip, axis_color, 2, cv2.LINE_AA)
+        return origin
 
     def draw_dashed_line(
         image: np.ndarray,
@@ -384,8 +431,8 @@ def _maybe_overlay_goal_pose_frames(
         panel: np.ndarray,
         current_xyz: np.ndarray,
         current_rotation: np.ndarray,
-        predicted_xyz: np.ndarray,
-        predicted_rotation: np.ndarray,
+        predicted_xyz: np.ndarray | None,
+        predicted_rotation: np.ndarray | None,
     ) -> None:
         height, width = panel.shape[:2]
         lower = q01[:3].astype(np.float64)
@@ -424,7 +471,7 @@ def _maybe_overlay_goal_pose_frames(
         projection_max = projected_corners.max(axis=0)
         projection_span = np.maximum(projection_max - projection_min, 1e-6)
         draw_left, draw_right = 18, width - 18
-        draw_top, draw_bottom = 45, height - 78
+        draw_top, draw_bottom = 42, height - 72
 
         def project_3d(point: np.ndarray) -> tuple[int, int]:
             relative = np.asarray(point, dtype=np.float64) - center
@@ -498,7 +545,7 @@ def _maybe_overlay_goal_pose_frames(
         axis_origin = lower.copy()
         axis_lengths = np.maximum((upper - lower) * 0.18, 0.035)
         for axis, (axis_name, axis_color) in enumerate(
-            (("X", (255, 60, 60)), ("Y", (60, 255, 60)), ("Z", (60, 120, 255)))
+            (("X", axis_rgb[0]), ("Y", axis_rgb[1]), ("Z", axis_rgb[2]))
         ):
             endpoint = axis_origin.copy()
             endpoint[axis] += axis_lengths[axis]
@@ -524,30 +571,46 @@ def _maybe_overlay_goal_pose_frames(
                 cv2.LINE_AA,
             )
 
-        for xyz, color in (
-            (current_xyz, (40, 110, 255)),
-            (predicted_xyz, (255, 40, 40)),
-        ):
+        markers = [(current_xyz, cur_rgb)]
+        if predicted_xyz is not None:
+            markers.append((predicted_xyz, pred_rgb))
+        for xyz, color in markers:
             floor_point = np.array([xyz[0], xyz[1], lower[2]])
             draw_dashed_line(
                 panel,
                 project_3d(floor_point),
                 project_3d(xyz),
                 color,
-                width=1,
+                width=2,
             )
 
         current_pixel = project_3d(current_xyz)
-        predicted_pixel = project_3d(predicted_xyz)
-        cv2.arrowedLine(
-            panel,
-            current_pixel,
-            predicted_pixel,
-            (210, 210, 210),
-            2,
-            cv2.LINE_AA,
-            tipLength=0.1,
+        predicted_pixel = (
+            project_3d(predicted_xyz) if predicted_xyz is not None else None
         )
+        close_on_panel = (
+            predicted_pixel is not None
+            and float(np.linalg.norm(np.asarray(current_pixel) - np.asarray(predicted_pixel))) < 48.0
+        )
+        if predicted_pixel is not None:
+            cv2.arrowedLine(
+                panel,
+                current_pixel,
+                predicted_pixel,
+                (0, 0, 0),
+                5,
+                cv2.LINE_AA,
+                tipLength=0.12,
+            )
+            cv2.arrowedLine(
+                panel,
+                current_pixel,
+                predicted_pixel,
+                link_rgb,
+                3,
+                cv2.LINE_AA,
+                tipLength=0.12,
+            )
 
         def draw_3d_pose(
             xyz: np.ndarray,
@@ -555,70 +618,84 @@ def _maybe_overlay_goal_pose_frames(
             *,
             color: tuple[int, int, int],
             label: str,
+            marker: str,
+            axis_length: float,
+            label_offset: tuple[int, int],
+            draw_axes: bool = True,
         ) -> None:
             origin_pixel = project_3d(xyz)
-            cv2.circle(panel, origin_pixel, 8, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.circle(panel, origin_pixel, 6, color, -1, cv2.LINE_AA)
-            cv2.putText(
+            if draw_axes:
+                for axis, axis_color in enumerate(axis_rgb):
+                    endpoint = np.asarray(xyz) + axis_length * rotation[:, axis]
+                    tip = project_3d(endpoint)
+                    cv2.line(panel, origin_pixel, tip, (0, 0, 0), 5, cv2.LINE_AA)
+                    cv2.line(panel, origin_pixel, tip, color, 4, cv2.LINE_AA)
+                    cv2.arrowedLine(
+                        panel,
+                        origin_pixel,
+                        tip,
+                        axis_color,
+                        2,
+                        cv2.LINE_AA,
+                        tipLength=0.16,
+                    )
+            draw_marker(panel, origin_pixel, color, marker)
+            draw_outlined_text(
                 panel,
                 label,
-                (origin_pixel[0] + 10, max(48, origin_pixel[1] - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                (
+                    origin_pixel[0] + label_offset[0],
+                    max(48, origin_pixel[1] + label_offset[1]),
+                ),
                 color,
-                1,
-                cv2.LINE_AA,
+                font_scale=0.5,
             )
-            for axis, axis_color in enumerate(
-                ((255, 60, 60), (60, 255, 60), (60, 120, 255))
-            ):
-                endpoint = np.asarray(xyz) + 0.055 * rotation[:, axis]
-                cv2.arrowedLine(
-                    panel,
-                    origin_pixel,
-                    project_3d(endpoint),
-                    axis_color,
-                    2,
-                    cv2.LINE_AA,
-                    tipLength=0.16,
-                )
 
         draw_3d_pose(
             current_xyz,
             current_rotation,
-            color=(40, 110, 255),
-            label="cur",
+            color=cur_rgb,
+            label="CUR",
+            marker="circle",
+            axis_length=0.05,
+            label_offset=(-54, -18),
+            draw_axes=not close_on_panel,
         )
-        draw_3d_pose(
-            predicted_xyz,
-            predicted_rotation,
-            color=(255, 40, 40),
-            label="pred@t+10",
+        if predicted_xyz is not None and predicted_rotation is not None:
+            draw_3d_pose(
+                predicted_xyz,
+                predicted_rotation,
+                color=pred_rgb,
+                label="PRED",
+                marker="square",
+                axis_length=0.08,
+                label_offset=(16, 22) if close_on_panel else (16, -14),
+            )
+            position_error_cm = float(np.linalg.norm(predicted_xyz - current_xyz) * 100.0)
+            draw_outlined_text(
+                panel,
+                f"CUR -> PRED: {position_error_cm:.1f} cm",
+                (14, height - 42),
+                (240, 240, 240),
+                font_scale=0.48,
+                thickness=1,
+            )
+            legend_3d = "cyan circle=current EE   red square=predicted t+10"
+        else:
+            legend_3d = "cyan circle=current EE   (no predicted goal pose)"
+        draw_outlined_text(
+            panel,
+            legend_3d,
+            (14, height - 18),
+            (210, 210, 210),
+            font_scale=0.36,
+            thickness=1,
         )
 
-        position_error_cm = float(np.linalg.norm(predicted_xyz - current_xyz) * 100.0)
-        cv2.putText(
-            panel,
-            f"cur -> pred: {position_error_cm:.1f} cm",
-            (14, height - 48),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.46,
-            (230, 230, 230),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            panel,
-            "blue=current   red=predicted chunk endpoint",
-            (14, height - 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            (190, 190, 190),
-            1,
-            cv2.LINE_AA,
-        )
-
-    n = min(batch_size, int(pose_world.shape[0]), len(env.envs))
+    n = min(batch_size, len(env.envs))
+    if pose_world is not None:
+        n = min(n, int(pose_world.shape[0]))
+    model_label = os.environ.get("POSE_VIZ_LABEL", "").strip()
     for i in range(n):
         sub = env.envs[i]
         inner = getattr(sub, "_env", None)
@@ -637,41 +714,100 @@ def _maybe_overlay_goal_pose_frames(
         raw_obs = inner.env._get_observations()
         current_xyz = np.asarray(raw_obs["robot0_eef_pos"], dtype=np.float64)
         current_rotation = np.asarray(inner.robots[0].controller.ee_ori_mat, dtype=np.float64)
-        predicted_rotation = rotation_matrix(pose_world[i, 3:6])
+        predicted_xyz = None
+        predicted_rotation = None
+        if pose_world is not None:
+            predicted_xyz = pose_world[i, :3]
+            predicted_rotation = rotation_matrix(pose_world[i, 3:6])
+        traj_dir = os.environ.get("POSE_TRAJ_DIR", "").strip()
+        if traj_dir and predicted_xyz is not None:
+            slot = _POSE_TRAJ.setdefault(
+                i, {"cur": [], "pred": [], "transform": transform, "first_frame": clean_frames[i],
+                    # the full MuJoCo state at t=0: lets the scene be rebuilt pixel-identical
+                    # at a higher resolution than the policy ran at
+                    "init_state": np.asarray(sim.get_state().flatten(), dtype=np.float64),
+                    "states": [],
+                    "bddl": str(getattr(inner, "bddl_file_name", "") or "")}
+            )
+            slot["cur"].append(np.asarray(current_xyz, dtype=np.float64).copy())
+            slot["states"].append(np.asarray(sim.get_state().flatten(), dtype=np.float64))
+            slot["pred"].append(np.asarray(predicted_xyz, dtype=np.float64).copy())
+            slot["transform"] = transform
+            _dump_pose_traj(i, traj_dir)
+        cur_px = project(current_xyz, transform, frame_height, frame_width)
+        pred_px = (
+            project(predicted_xyz, transform, frame_height, frame_width)
+            if predicted_xyz is not None
+            else None
+        )
+        if cur_px is not None and pred_px is not None:
+            cv2.arrowedLine(
+                camera_frame,
+                cur_px,
+                pred_px,
+                (0, 0, 0),
+                5,
+                cv2.LINE_AA,
+                tipLength=0.18,
+            )
+            cv2.arrowedLine(
+                camera_frame,
+                cur_px,
+                pred_px,
+                link_rgb,
+                3,
+                cv2.LINE_AA,
+                tipLength=0.18,
+            )
+        close_on_image = (
+            cur_px is not None
+            and pred_px is not None
+            and float(np.linalg.norm(np.asarray(cur_px) - np.asarray(pred_px))) < 70.0
+        )
         draw_pose(
             camera_frame,
             current_xyz,
             current_rotation,
             transform,
-            color=(40, 110, 255),
-            label="cur",
+            color=cur_rgb,
+            label="CUR",
+            marker="circle",
+            axis_length=0.05,
+            draw_axes=not close_on_image,
+            label_offset=(-48, -16) if close_on_image else (14, -14),
         )
-        draw_pose(
+        if predicted_xyz is not None and predicted_rotation is not None:
+            draw_pose(
+                camera_frame,
+                predicted_xyz,
+                predicted_rotation,
+                transform,
+                color=pred_rgb,
+                label="PRED",
+                marker="square",
+                axis_length=0.09,
+                draw_axes=True,
+                label_offset=(16, 24) if close_on_image else (16, -14),
+            )
+            legend = "CUR=cyan circle   PRED=red square (t+10)"
+        else:
+            legend = "CUR=cyan circle   (no predicted goal)"
+        if model_label:
+            legend = f"{model_label} | {legend}"
+        cv2.rectangle(
             camera_frame,
-            pose_world[i, :3],
-            predicted_rotation,
-            transform,
-            color=(255, 40, 40),
-            label="pred",
+            (4, 4),
+            (min(frame_width - 4, 500), 28),
+            (0, 0, 0),
+            thickness=-1,
         )
-        text = "pred xyz=({:.3f}, {:.3f}, {:.3f})".format(*pose_world[i, :3])
-        cv2.rectangle(camera_frame, (4, 4), (280, 25), (0, 0, 0), thickness=-1)
-        cv2.putText(
-            camera_frame,
-            text,
-            (8, 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        draw_outlined_text(camera_frame, legend, (8, 22), (255, 255, 255), font_scale=0.42, thickness=1)
         _draw_prompt_on_frame(camera_frame, _pose_viz_task_prompt(sub))
         draw_3d_workspace(
             out[i, :, frame_width:],
             current_xyz,
             current_rotation,
-            pose_world[i, :3],
+            predicted_xyz,
             predicted_rotation,
         )
     return out
@@ -935,9 +1071,10 @@ def eval_policy(
         else:
             return
 
-        # Optional goal-pose overlay for MolmoAct2 when POSE_VIZ_DIR is set.
+        # Optional pose overlay when POSE_VIZ_DIR is set.
+        # Baseline has no predicted goal; the overlay still draws current EE.
         pose_viz_dir = os.environ.get("POSE_VIZ_DIR", "").strip()
-        if pose_viz_dir and hasattr(policy, "get_last_goal_pose_norm"):
+        if pose_viz_dir:
             try:
                 frames_now = _maybe_overlay_goal_pose_frames(
                     policy,
