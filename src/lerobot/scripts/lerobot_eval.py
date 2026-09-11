@@ -308,7 +308,7 @@ def _maybe_overlay_goal_pose_frames(
             width,
         )[0]
         row, col = int(pixels[0]), int(pixels[1])
-        row = height - 1 - row
+        # displayed frame is obs[::-1, ::-1]; verified mapping is (x, y) = (W-1-col, row): mirror columns only
         col = width - 1 - col
         if not (0 <= row < height and 0 <= col < width):
             return None
